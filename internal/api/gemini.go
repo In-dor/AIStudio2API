@@ -1279,6 +1279,11 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 	for index, result := range results {
 		candidate := map[string]any{"index": index}
 		setGeminiFinish(candidate, result.finishReason, result.finishMessage)
+		if result.grounding != nil {
+			candidate["groundingMetadata"] = geminiGroundingMetadata(*result.grounding)
+		} else if len(result.citations) > 0 {
+			candidate["citationMetadata"] = geminiCitationMetadata(result.citations)
+		}
 		finished = append(finished, candidate)
 	}
 	final := map[string]any{
