@@ -99,6 +99,7 @@ export interface RequestLog {
   channel?: UpstreamChannel
   usage?: {
     input_tokens: number
+    cached_tokens: number
     reasoning_tokens: number
     reply_tokens: number
     output_tokens: number
@@ -191,6 +192,7 @@ export interface UsageStats {
   canceled: number
   rate_limited: number
   input_tokens: number
+  cached_tokens: number
   reasoning_tokens: number
   reply_tokens: number
   total_tokens: number
@@ -202,6 +204,7 @@ export interface UsageStats {
 
 export interface UsageBucket extends UsageStats {
   at: string
+  cost: number
 }
 
 export interface UsageGroup extends UsageStats {
@@ -228,6 +231,8 @@ export interface UsageReport {
   latest_at?: string
   totals: UsageStats
   previous: UsageStats
+  cost: number
+  previous_cost: number
   recent: { minutes: number; requests: number; tokens: number }
   buckets: UsageBucket[]
   stack_by: UsageDimension
@@ -258,6 +263,7 @@ export interface UsageRecord {
   first_event_ms: number
   queue_ms: number
   input_tokens: number
+  cached_tokens: number
   reasoning_tokens: number
   reply_tokens: number
   total_tokens: number

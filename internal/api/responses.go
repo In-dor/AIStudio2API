@@ -1,6 +1,7 @@
 package api
 
 import (
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -319,6 +320,10 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if responsesCompactionTrigger(request.Input) {
+		s.handleCompactionTrigger(w, r, request, prepared, responseID)
+		return
+	}
 	generateRequest := prepared.generate
 	generateRequest.Unary = !request.Stream
 	events, err := s.service.Generate(r.Context(), generateRequest)
@@ -549,14 +554,19 @@ func (request responsesRequest) toGenerateRequest(id string) (aistudio.GenerateR
 		TopP:            request.TopP,
 		MaxOutputTokens: request.MaxOutputTokens,
 	}
+	config.HideThinking = true
 	if len(request.Reasoning) > 0 && string(request.Reasoning) != "null" {
 		var reasoning struct {
-			Effort string `json:"effort"`
+			Effort          string `json:"effort"`
+			Summary         string `json:"summary"`
+			GenerateSummary string `json:"generate_summary"`
 		}
 		if err := json.Unmarshal(request.Reasoning, &reasoning); err != nil {
 			return aistudio.GenerateRequest{}, nil, fmt.Errorf("invalid reasoning: %w", err)
 		}
 		config.ReasoningEffort = reasoning.Effort
+		summary := cmp.Or(reasoning.Summary, reasoning.GenerateSummary)
+		config.HideThinking = summary == "" || summary == "none"
 	}
 	if len(request.Text) > 0 && string(request.Text) != "null" {
 		var text struct {
@@ -602,14 +612,22 @@ func responsesContents(raw json.RawMessage) ([]aistudio.Content, []string, error
 	if err := json.Unmarshal(raw, &items); err != nil {
 		return nil, nil, fmt.Errorf("input must be a string or item array")
 	}
+	window, err := splitCompaction(items)
+	if err != nil {
+		return nil, nil, err
+	}
+	items = window.items()
 	contents := make([]aistudio.Content, 0, len(items))
 	var instructions []string
 	var systemMedia []aistudio.Part
 	pendingSignature := ""
-	for _, rawItem := range items {
+	for index, rawItem := range items {
 		var item responsesInputItem
 		switch kind := responsesItemType(rawItem); kind {
-		case "compaction", "compaction_trigger":
+		case "compaction_trigger":
+			if index != len(items)-1 {
+				return nil, nil, fmt.Errorf("compaction_trigger must be the final input item")
+			}
 			continue
 		case "web_search_call", "code_interpreter_call", "image_generation_call", "file_search_call", "computer_call", "computer_call_output",
 			"mcp_call", "mcp_list_tools", "mcp_approval_request", "mcp_approval_response", "tool_search_call", "tool_search_output":
@@ -1102,7 +1120,7 @@ func responsesUsage(usage *aistudio.Usage) map[string]any {
 		"output_tokens": outputTokens(usage),
 		"total_tokens":  usage.TotalTokens,
 		"input_tokens_details": map[string]any{
-			"cached_tokens": 0,
+			"cached_tokens": usage.CachedTokens,
 		},
 		"output_tokens_details": map[string]any{
 			"reasoning_tokens": usage.ReasoningTokens,
