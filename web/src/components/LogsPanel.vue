@@ -376,7 +376,7 @@ watch(autoScroll, () => {
   bottom: 0;
   left: 50%;
   width: 1px;
-  background: #30363d;
+  background: var(--color-line);
   content: '';
   transition: background-color 120ms ease;
 }
