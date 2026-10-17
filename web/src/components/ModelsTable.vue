@@ -58,7 +58,7 @@ function tokenLimit(value: number | undefined): string {
 </script>
 
 <template>
-  <section class="mx-auto w-full max-w-4xl flex-1 overflow-auto p-4 md:p-8">
+  <section class="mx-auto w-full max-w-4xl min-h-0 flex-1 overflow-auto p-4 md:p-8">
     <h2 class="mb-6 border-b border-line pb-2 text-2xl font-bold text-white">
       {{ t('section.models.title') }}
     </h2>

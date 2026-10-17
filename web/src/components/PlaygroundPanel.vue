@@ -459,7 +459,7 @@ onUnmounted(() => {
 
 <template>
   <section class="flex min-h-0 flex-1 bg-canvas">
-    <div class="flex min-w-0 flex-1 flex-col">
+    <div class="flex min-h-0 min-w-0 flex-1 flex-col">
       <header class="flex h-12 shrink-0 items-center gap-2 border-b border-line px-3 md:px-4">
         <div
           class="flex min-w-0 items-center gap-1 overflow-x-auto"

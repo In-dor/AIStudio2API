@@ -418,30 +418,41 @@ onUnmounted(() => {
           <div class="h-3 w-3 rounded-full" :class="statusColor"></div>
           <h1 class="whitespace-nowrap text-lg font-bold text-white">AI Studio Proxy</h1>
         </div>
-        <DropdownMenuRoot :modal="false">
-          <DropdownMenuTrigger
-            class="flex shrink-0 items-center gap-1 whitespace-nowrap rounded border border-gray-700 px-1.5 py-0.5 font-mono text-xs text-gray-500 transition hover:text-white data-[state=open]:text-white"
+        <div class="flex items-center gap-2">
+          <button
+            v-if="adminUsername"
+            type="button"
+            class="flex items-center gap-1 rounded border border-line px-2 py-0.5 font-mono text-xs text-gray-400 hover:bg-raised hover:text-white md:hidden"
+            @click="logout"
           >
-            {{ locale }}
-            <UiIcon name="chevronDown" :size="12" />
-          </DropdownMenuTrigger>
-          <DropdownMenuPortal>
-            <DropdownMenuContent
-              align="end"
-              :side-offset="4"
-              class="z-[60] overflow-hidden rounded border border-line bg-panel shadow-xl"
+            <UiIcon name="login" :size="12" />
+            <span class="max-w-[80px] truncate">{{ adminUsername }}</span>
+          </button>
+          <DropdownMenuRoot :modal="false">
+            <DropdownMenuTrigger
+              class="flex shrink-0 items-center gap-1 whitespace-nowrap rounded border border-gray-700 px-1.5 py-0.5 font-mono text-xs text-gray-500 transition hover:text-white data-[state=open]:text-white"
             >
-              <DropdownMenuItem
-                v-for="item in availableLocales"
-                :key="item.code"
-                class="block w-full cursor-pointer px-4 py-2 text-left text-xs whitespace-nowrap text-gray-300 outline-none data-[highlighted]:bg-blue-600 data-[highlighted]:text-white"
-                @select="setLocale(item.code)"
+              {{ locale }}
+              <UiIcon name="chevronDown" :size="12" />
+            </DropdownMenuTrigger>
+            <DropdownMenuPortal>
+              <DropdownMenuContent
+                align="end"
+                :side-offset="4"
+                class="z-[60] overflow-hidden rounded border border-line bg-panel shadow-xl"
               >
-                {{ item.label }}
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenuPortal>
-        </DropdownMenuRoot>
+                <DropdownMenuItem
+                  v-for="item in availableLocales"
+                  :key="item.code"
+                  class="block w-full cursor-pointer px-4 py-2 text-left text-xs whitespace-nowrap text-gray-300 outline-none data-[highlighted]:bg-blue-600 data-[highlighted]:text-white"
+                  @select="setLocale(item.code)"
+                >
+                  {{ item.label }}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenuPortal>
+          </DropdownMenuRoot>
+        </div>
       </div>
 
       <nav
@@ -469,7 +480,7 @@ onUnmounted(() => {
       <button
         v-if="adminUsername"
         type="button"
-        class="mx-4 mb-3 rounded border border-line px-3 py-2 text-gray-400 hover:bg-raised hover:text-white"
+        class="hidden mx-4 mb-3 rounded border border-line px-3 py-2 text-gray-400 hover:bg-raised hover:text-white md:block"
         @click="logout"
       >
         {{ adminUsername }} · {{ t('auth.logout') }}
@@ -480,21 +491,45 @@ onUnmounted(() => {
         :class="serviceState === 'launching' ? 'launching-shell' : ''"
       >
         <div v-if="serviceState === 'launching'" class="launching-scan" aria-hidden="true"></div>
-        <div class="mb-2 text-xs text-gray-500">{{ t('app.status') }}</div>
-        <div class="mb-4 flex items-center justify-between">
-          <span class="font-mono font-bold" :class="statusTextColor">
-            {{ serviceState.toUpperCase() }}
-          </span>
-          <span
-            v-tooltip="status?.version || ''"
-            class="max-w-[65%] truncate font-mono text-xs text-gray-500"
-          >
-            {{ status?.version || '—' }}
-          </span>
+        <div class="hidden mb-2 text-xs text-gray-500 md:block">{{ t('app.status') }}</div>
+        <div class="flex items-center justify-between gap-2 md:mb-4">
+          <div class="flex items-center gap-2 min-w-0">
+            <span class="font-mono font-bold text-xs sm:text-sm" :class="statusTextColor">
+              {{ serviceState.toUpperCase() }}
+            </span>
+            <span
+              v-tooltip="status?.version || ''"
+              class="max-w-[120px] truncate font-mono text-xs text-gray-500 sm:max-w-[200px]"
+            >
+              {{ status?.version || '—' }}
+            </span>
+          </div>
+          <div class="md:hidden">
+            <button
+              v-if="serviceState === 'stopped'"
+              class="flex items-center justify-center gap-1.5 rounded bg-green-600 px-3 py-1 text-xs font-bold text-white shadow transition hover:bg-green-500 disabled:opacity-50"
+              type="button"
+              :disabled="startPending || stopPending"
+              @click="startService"
+            >
+              <UiIcon :name="startPending ? 'spinner' : 'play'" :size="13" />
+              {{ t('app.start') }}
+            </button>
+            <button
+              v-else-if="serviceState === 'launching' || serviceState === 'running'"
+              class="flex items-center justify-center gap-1.5 rounded bg-red-600 px-3 py-1 text-xs font-bold text-white shadow transition hover:bg-red-500 disabled:opacity-50"
+              type="button"
+              :disabled="stopPending"
+              @click="stopService"
+            >
+              <UiIcon :name="stopPending ? 'spinner' : 'stop'" :size="13" />
+              {{ t('app.stop') }}
+            </button>
+          </div>
         </div>
         <button
           v-if="serviceState === 'stopped'"
-          class="flex w-full items-center justify-center gap-2 rounded bg-green-600 py-2 font-bold text-white shadow transition hover:bg-green-500 disabled:opacity-50"
+          class="hidden w-full items-center justify-center gap-2 rounded bg-green-600 py-2 font-bold text-white shadow transition hover:bg-green-500 disabled:opacity-50 md:flex"
           type="button"
           :disabled="startPending || stopPending"
           @click="startService"
@@ -504,7 +539,7 @@ onUnmounted(() => {
         </button>
         <button
           v-else-if="serviceState === 'launching' || serviceState === 'running'"
-          class="flex w-full items-center justify-center gap-2 rounded bg-red-600 py-2 font-bold text-white shadow transition hover:bg-red-500 disabled:opacity-50"
+          class="hidden w-full items-center justify-center gap-2 rounded bg-red-600 py-2 font-bold text-white shadow transition hover:bg-red-500 disabled:opacity-50 md:flex"
           type="button"
           :disabled="stopPending"
           @click="stopService"
@@ -515,7 +550,7 @@ onUnmounted(() => {
       </div>
     </aside>
 
-    <main class="flex min-w-0 flex-1 flex-col bg-canvas">
+    <main class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-canvas">
       <Transition name="page">
         <KeepAlive include="SettingsPanel">
           <LogsPanel v-if="currentTab === 'logs'" :logs="logs" @clear="clearLogs" />
