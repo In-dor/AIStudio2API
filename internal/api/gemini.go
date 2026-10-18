@@ -404,10 +404,14 @@ func geminiFilesAPIURI(raw string) bool {
 var geminiOpaqueFields = map[string]bool{
 	"args": true, "response": true, "parameters": true, "parametersJsonSchema": true,
 	"responseSchema": true, "responseJsonSchema": true, "partMetadata": true, "schema": true,
+	"inlineData": true, "inline_data": true,
 }
 
 // geminiCamelKeys 按 proto3 JSON 规则把各层消息字段名转为 lowerCamelCase，同层两种写法并存时保留驼峰字段，自由 JSON 字段的取值原样保留
 func geminiCamelKeys(raw []byte) ([]byte, bool, error) {
+	if bytes.IndexByte(raw, '_') < 0 {
+		return raw, false, nil
+	}
 	value := bytes.TrimSpace(raw)
 	if len(value) == 0 || value[0] != '{' && value[0] != '[' {
 		return raw, false, nil

@@ -122,7 +122,7 @@ func (t *WorkerProtectedTransport) DoProtected(ctx context.Context, request Gene
 		proofField = assistantProofField
 	default:
 		prompt, err = bindingPrompt(request)
-		page = prompt
+		page = contentsText(request.Contents)
 	}
 	if err != nil {
 		return nil, err
@@ -252,36 +252,47 @@ func bindingPrompt(request GenerateRequest) (string, error) {
 	if len(request.Contents) == 0 {
 		return "", fmt.Errorf("GenerateContent contents 不能为空")
 	}
-	values := make([]string, 0)
+	var b strings.Builder
+	first := true
 	for _, content := range request.Contents {
 		content = attachYouTubeMedia(content)
 		for _, part := range content.Parts {
+			if !first {
+				b.WriteByte(' ')
+			}
+			first = false
 			switch {
 			case part.Text != "":
-				values = append(values, part.Text)
+				b.WriteString(part.Text)
 			case part.InlineData != nil:
-				values = append(values, base64.StdEncoding.EncodeToString(part.InlineData.Data))
+				enc := base64.NewEncoder(base64.StdEncoding, &b)
+				_, _ = enc.Write(part.InlineData.Data)
+				_ = enc.Close()
 			case part.File != nil:
-				values = append(values, part.File.ID)
+				b.WriteString(part.File.ID)
 			default:
-				values = append(values, "")
 			}
 		}
 	}
-	return strings.Join(values, " "), nil
+	return b.String(), nil
 }
 
 // contentsText 返回各 Part 的文本以空格连接，作为 Build 请求写入页面的提示词
 func contentsText(contents []Content) string {
-	values := make([]string, 0)
+	var b strings.Builder
+	first := true
 	for _, content := range contents {
 		for _, part := range content.Parts {
 			if part.Text != "" {
-				values = append(values, part.Text)
+				if !first {
+					b.WriteByte(' ')
+				}
+				first = false
+				b.WriteString(part.Text)
 			}
 		}
 	}
-	return strings.Join(values, " ")
+	return b.String()
 }
 
 // RequestContext 返回账户时区

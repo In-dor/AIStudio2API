@@ -279,11 +279,20 @@ func (runtime *Runtime) Proof(ctx context.Context, digest string, prompt string)
 	if err := runtime.fillPrompt(ctx, prompt, false); err != nil {
 		return "", err
 	}
-	return runtime.snapshotWith(ctx, func(vm *goja.Runtime) goja.Value {
+	proof, err := runtime.snapshotWith(ctx, func(vm *goja.Runtime) goja.Value {
 		content := vm.NewObject()
 		_ = content.Set("content", digest)
 		return vm.NewArray(content, goja.Undefined(), goja.Undefined(), goja.Undefined())
 	})
+	if err != nil {
+		return "", err
+	}
+	if len(prompt) > 0 {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = runtime.fillPrompt(cleanupCtx, "", false)
+		cancel()
+	}
+	return proof, nil
 }
 
 // RefreshSnapshot 生成官网刷新 Waa/Create 时携带的无绑定 snapshot

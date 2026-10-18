@@ -8,6 +8,8 @@ import (
 	"maps"
 	"net/http"
 	"net/url"
+	"runtime"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strings"
@@ -3367,6 +3369,7 @@ func (service *trackedService) generateWithRetry(
 	var temporaryCopies *aistudio.TemporaryFileCopies
 	var err error
 	originalContents := request.Contents
+	_, totalMediaBytes := inlineMediaInput(originalContents)
 	attempted := make(map[string]struct{}, maxAttempts)
 	recoveredWorker := make(map[string]struct{})
 	recoveryAccountID := ""
@@ -3710,11 +3713,18 @@ func (service *trackedService) generateWithRetry(
 		}
 		cancel()
 		close(destination)
+		if totalMediaBytes > 1024*1024 {
+			go func() {
+				time.Sleep(300 * time.Millisecond)
+				runtime.GC()
+				debug.FreeOSMemory()
+			}()
+		}
 		return
 	}
 	service.forwardEvents(
 		clientCtx, requestCtx, cancel, request.ID,
-		first, source, destination, lease, temporaryCopies, activity, modelID,
+		first, source, destination, lease, temporaryCopies, activity, modelID, totalMediaBytes,
 	)
 }
 
@@ -3882,6 +3892,7 @@ func (service *trackedService) forwardEvents(
 	temporaryCopies *aistudio.TemporaryFileCopies,
 	activity *upstreamActivity,
 	requestedModelID string,
+	mediaBytes int64,
 ) {
 	state := "completed"
 	var requestErr error
@@ -3945,6 +3956,13 @@ func (service *trackedService) forwardEvents(
 		api.SetAccessLogError(requestCtx, requestErr)
 		service.requests.finish(requestID, state, requestErr)
 		close(destination)
+		if mediaBytes > 1024*1024 {
+			go func() {
+				time.Sleep(300 * time.Millisecond)
+				runtime.GC()
+				debug.FreeOSMemory()
+			}()
+		}
 	}()
 	pendingFirst := true
 	verified := false
