@@ -25,6 +25,7 @@ const cancelling = ref('')
 const refreshing = ref(false)
 const selectedCategory = ref('')
 const detail = ref<Cooldown | null>(null)
+const clearing = ref(false)
 
 // splitReason 把冷却原因拆成冷却类型与上游错误原文
 function splitReason(reason: string | undefined): { category: string; text: string } {
@@ -117,6 +118,21 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
     cancelling.value = ''
   }
 }
+
+// clearCooldown 手动清除详情中的冷却，成功后关闭详情并刷新列表
+async function clearCooldown(cooldown: Cooldown): Promise<void> {
+  clearing.value = true
+  try {
+    await api.clearCooldown(cooldown.account_id, cooldown.scope)
+    detail.value = null
+    emit('notice', t('cooldowns.cleared'), 'success')
+    emit('refresh')
+  } catch (error) {
+    emit('notice', errorText(error), 'error')
+  } finally {
+    clearing.value = false
+  }
+}
 </script>
 
 <template>
@@ -198,12 +214,14 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
                 {{ t(channelLabelKey(cooldown.channel)) }}</span
               >
             </div>
-            <span class="shrink-0 rounded bg-yellow-500/10 px-2 py-0.5 text-xs text-yellow-300">{{
-              categoryLabel(splitReason(cooldown.reason).category)
-            }}</span>
-            <time class="w-28 shrink-0 text-right font-mono text-xs text-gray-400">{{
-              formatTime(cooldown.until)
-            }}</time>
+            <div class="flex shrink-0 flex-col items-end gap-1">
+              <span class="rounded bg-yellow-500/10 px-2 py-0.5 text-xs text-yellow-300">{{
+                categoryLabel(splitReason(cooldown.reason).category)
+              }}</span>
+              <time class="font-mono text-xs whitespace-nowrap text-gray-400">{{
+                formatTime(cooldown.until)
+              }}</time>
+            </div>
             <UiIcon name="chevronRight" :size="14" class="shrink-0 text-gray-600" />
           </button>
         </div>
@@ -256,7 +274,7 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
                 ></span
               >
             </div>
-            <time class="shrink-0 font-mono text-xs text-gray-500">{{
+            <time class="shrink-0 font-mono text-xs whitespace-nowrap text-gray-500">{{
               formatTime(request.started_at)
             }}</time>
             <button
@@ -295,6 +313,20 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
         <pre
           class="rounded-md border border-line bg-canvas p-3 font-mono text-xs leading-5 whitespace-pre-wrap [overflow-wrap:anywhere] text-gray-300"
           >{{ splitReason(detail.reason).text || '—' }}</pre>
+        <div class="mt-4 flex items-center justify-end gap-3">
+          <span v-if="detail.scope === '*'" class="text-xs text-gray-500">{{
+            t('cooldowns.clearAccountHint')
+          }}</span>
+          <button
+            type="button"
+            class="shrink-0 rounded border border-line bg-raised px-3 py-1.5 text-sm text-gray-200 transition hover:bg-line disabled:opacity-50"
+            :disabled="clearing"
+            :aria-busy="clearing"
+            @click="clearCooldown(detail)"
+          >
+            {{ t('cooldowns.clear') }}
+          </button>
+        </div>
       </template>
     </DetailDialog>
   </section>
