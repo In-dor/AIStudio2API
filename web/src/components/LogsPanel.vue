@@ -137,7 +137,7 @@ function scrollToBottom(): void {
 
 // followScroll 在日志区离开末尾时关闭自动滚动，回到末尾时开启
 function followScroll(): void {
-  if (programmaticScroll || output.value === undefined) return
+  if (programmaticScroll || !output.value) return
   const element = output.value
   const distance = element.scrollHeight - element.scrollTop - element.clientHeight
   if (autoScroll.value && distance > 40) autoScroll.value = false

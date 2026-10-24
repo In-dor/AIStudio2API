@@ -238,12 +238,17 @@ type RuntimeConfig struct {
 	SavedAdminPassword        string       `json:"-"`
 	BuildNativeNonstream      bool         `json:"build_native_nonstream"`
 	IgnoreThoughtSignature    bool         `json:"ignore_thought_signature"`
+	NonstreamKeepalive        bool         `json:"nonstream_keepalive"`
+	FakeStream                bool         `json:"fake_stream"`
+	YouTubeLinks              bool         `json:"youtube_links"`
 	LogFile                   bool         `json:"log_file"`
 	LogMaxTotalMB             int          `json:"log_max_total_mb"`
 	AuthStates                string       `json:"auth_states"`
 	ListenAddr                string       `json:"listen_addr"`
 	APIKey                    string       `json:"proxy_api_key"`
 	ActiveListenAddr          string       `json:"active_listen_addr"`
+	PreviewListenAddr         string       `json:"preview_listen_addr"`
+	ActivePreviewListenAddr   string       `json:"active_preview_listen_addr"`
 	ActiveAPIKey              string       `json:"active_proxy_api_key"`
 	ManagementRestartRequired bool         `json:"management_restart_required"`
 	ServiceRestartRequired    bool         `json:"service_restart_required"`

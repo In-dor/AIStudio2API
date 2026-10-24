@@ -36,10 +36,15 @@ const form = reactive<ServiceConfig>({
   admin_password_set: false,
   build_native_nonstream: true,
   ignore_thought_signature: true,
+  nonstream_keepalive: true,
+  fake_stream: false,
+  youtube_links: false,
   auth_states: 'auth',
   listen_addr: '127.0.0.1:2048',
+  preview_listen_addr: '127.0.0.1:2050',
   proxy_api_key: '',
   active_listen_addr: '127.0.0.1:2048',
+  active_preview_listen_addr: '127.0.0.1:2050',
   active_proxy_api_key: '',
   management_restart_required: false,
   service_restart_required: false,
@@ -80,6 +85,7 @@ const sections: {
     fields: [
       'auto_start',
       'listen_addr',
+      'preview_listen_addr',
       'proxy_api_key',
       'auth_states',
       'media_output',
@@ -110,6 +116,9 @@ const sections: {
       'model_channels',
       'build_native_nonstream',
       'ignore_thought_signature',
+      'nonstream_keepalive',
+      'fake_stream',
+      'youtube_links',
       'waa_backend',
       'temporary_chat',
       'init_timeout',
@@ -320,6 +329,27 @@ async function saveConfig(): Promise<void> {
                 class="mt-1 text-xs break-all text-gray-500"
               >
                 {{ t('settings.activeValue') }}: {{ config.active_listen_addr }}
+              </p>
+            </SettingRow>
+            <SettingRow
+              :label="t('settings.previewListen')"
+              control-id="setting-preview-listen"
+              :description="t('settings.previewListenHelp')"
+              effect="management"
+              :changed="changedFields.has('preview_listen_addr')"
+            >
+              <input
+                id="setting-preview-listen"
+                v-model.trim="form.preview_listen_addr"
+                :class="inputClass"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <p
+                v-if="form.preview_listen_addr !== config.active_preview_listen_addr"
+                class="mt-1 text-xs break-all text-gray-500"
+              >
+                {{ t('settings.activeValue') }}: {{ config.active_preview_listen_addr }}
               </p>
             </SettingRow>
             <SettingRow
@@ -558,6 +588,33 @@ async function saveConfig(): Promise<void> {
               :changed="changedFields.has('ignore_thought_signature')"
             >
               <UiSwitch id="setting-ignore-thought-signature" v-model="form.ignore_thought_signature" />
+            </SettingRow>
+            <SettingRow
+              :label="t('settings.nonstreamKeepalive')"
+              control-id="setting-nonstream-keepalive"
+              :description="t('settings.nonstreamKeepaliveHelp')"
+              effect="service"
+              :changed="changedFields.has('nonstream_keepalive')"
+            >
+              <UiSwitch id="setting-nonstream-keepalive" v-model="form.nonstream_keepalive" />
+            </SettingRow>
+            <SettingRow
+              :label="t('settings.fakeStream')"
+              control-id="setting-fake-stream"
+              :description="t('settings.fakeStreamHelp')"
+              effect="service"
+              :changed="changedFields.has('fake_stream')"
+            >
+              <UiSwitch id="setting-fake-stream" v-model="form.fake_stream" />
+            </SettingRow>
+            <SettingRow
+              :label="t('settings.youtubeLinks')"
+              control-id="setting-youtube-links"
+              :description="t('settings.youtubeLinksHelp')"
+              effect="service"
+              :changed="changedFields.has('youtube_links')"
+            >
+              <UiSwitch id="setting-youtube-links" v-model="form.youtube_links" />
             </SettingRow>
             <SettingRow
               :label="t('settings.waaBackend')"
