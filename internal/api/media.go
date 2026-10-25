@@ -444,8 +444,10 @@ func wavPCM(media aistudio.Media) (aistudio.Media, error) {
 // decodeBase64Flexible 根据字母表和填充形式解码 Base64 与 Data URL
 func decodeBase64Flexible(s string) ([]byte, error) {
 	s = strings.TrimSpace(s)
-	if idx := strings.Index(s, ","); idx != -1 && strings.HasPrefix(s, "data:") {
-		s = s[idx+1:]
+	if strings.HasPrefix(s, "data:") {
+		if idx := strings.IndexByte(s, ','); idx != -1 {
+			s = s[idx+1:]
+		}
 	}
 	encoding := base64.StdEncoding
 	if index := strings.IndexAny(s, "+/-_"); index >= 0 && (s[index] == '-' || s[index] == '_') {

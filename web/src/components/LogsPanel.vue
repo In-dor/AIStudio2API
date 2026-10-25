@@ -125,7 +125,7 @@ let programmaticScroll = false
 function scrollToBottom(): void {
   if (!autoScroll.value) return
   void nextTick(() => {
-    if (output.value !== undefined) {
+    if (output.value) {
       programmaticScroll = true
       output.value.scrollTop = output.value.scrollHeight
       requestAnimationFrame(() => {

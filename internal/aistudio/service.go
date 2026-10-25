@@ -25,6 +25,7 @@ type PooledService struct {
 	BuildNativeNonstream bool
 	// IgnoreThoughtSignature 忽略历史消息中的思考签名以避免 400 校验错误
 	IgnoreThoughtSignature bool
+	ignoreThoughtSigMu     sync.RWMutex
 	// YouTubeLinks 把 user 文本中的 YouTube 链接作为视频外部媒体发送
 	YouTubeLinks bool
 	// omniVideos 记录本进程中尚无结果文件的 Omni 视频任务：值为 nil 时仍在生成，为 error 时生成失败
@@ -240,7 +241,26 @@ func bindingPrompt(request GenerateRequest) (string, error) {
 	if len(request.Contents) == 0 {
 		return "", fmt.Errorf("GenerateContent contents 不能为空")
 	}
+	totalLen := 0
+	partCount := 0
+	for _, content := range request.Contents {
+		for _, part := range content.Parts {
+			partCount++
+			switch {
+			case part.Text != "":
+				totalLen += len(part.Text)
+			case part.InlineData != nil:
+				totalLen += base64.StdEncoding.EncodedLen(len(part.InlineData.Data))
+			case part.File != nil:
+				totalLen += len(part.File.ID)
+			}
+		}
+	}
+	if partCount > 1 {
+		totalLen += partCount - 1
+	}
 	var b strings.Builder
+	b.Grow(totalLen)
 	first := true
 	for _, content := range request.Contents {
 		for _, part := range content.Parts {
@@ -266,7 +286,24 @@ func bindingPrompt(request GenerateRequest) (string, error) {
 
 // contentsText 返回各 Part 的文本以空格连接，作为写入页面输入框的提示词
 func contentsText(contents []Content) string {
+	totalLen := 0
+	textCount := 0
+	for _, content := range contents {
+		for _, part := range content.Parts {
+			if part.Text != "" {
+				textCount++
+				totalLen += len(part.Text)
+			}
+		}
+	}
+	if textCount == 0 {
+		return ""
+	}
+	if textCount > 1 {
+		totalLen += textCount - 1
+	}
 	var b strings.Builder
+	b.Grow(totalLen)
 	first := true
 	for _, content := range contents {
 		for _, part := range content.Parts {
@@ -567,16 +604,30 @@ func (s *PooledService) catalogFailure(lease *AccountLease, err error) error {
 	return err
 }
 
+// SetIgnoreThoughtSignature 并发安全地更新是否忽略历史思考签名
+func (s *PooledService) SetIgnoreThoughtSignature(enabled bool) {
+	s.ignoreThoughtSigMu.Lock()
+	s.IgnoreThoughtSignature = enabled
+	s.ignoreThoughtSigMu.Unlock()
+}
+
+func (s *PooledService) shouldIgnoreThoughtSignature() bool {
+	s.ignoreThoughtSigMu.RLock()
+	enabled := s.IgnoreThoughtSignature
+	s.ignoreThoughtSigMu.RUnlock()
+	return enabled
+}
+
 // CountTokens 使用支持目标模型的独占账户计数
 func (s *PooledService) CountTokens(ctx context.Context, request TokenCountRequest) (TokenCount, error) {
 	modelID := strings.TrimPrefix(strings.TrimSpace(request.Model), "models/")
 	if modelID == "" {
 		return TokenCount{}, fmt.Errorf("%w: CountTokens model 不能为空", ErrInvalidArgument)
 	}
-	request.System, request.Contents = normalizeTurns(request.System, request.Contents)
-	if s.IgnoreThoughtSignature {
+	if s.shouldIgnoreThoughtSignature() {
 		request.Contents = sanitizeThoughtSignatures(request.Contents)
 	}
+	request.System, request.Contents = normalizeTurns(request.System, request.Contents)
 	if s.YouTubeLinks {
 		request.Contents = attachYouTubeLinks(request.Contents)
 	}
@@ -634,10 +685,10 @@ func (s *PooledService) ValidateGenerateRequest(request GenerateRequest) error {
 	if strings.TrimPrefix(strings.TrimSpace(request.Model), "models/") == "" {
 		return fmt.Errorf("%w: GenerateContent model 不能为空", ErrInvalidArgument)
 	}
-	request.System, request.Contents = normalizeTurns(request.System, request.Contents)
-	if s.IgnoreThoughtSignature {
+	if s.shouldIgnoreThoughtSignature() {
 		request.Contents = sanitizeThoughtSignatures(request.Contents)
 	}
+	request.System, request.Contents = normalizeTurns(request.System, request.Contents)
 	if len(request.Contents) == 0 {
 		return fmt.Errorf("%w: 请求没有系统提示或对话内容", ErrInvalidArgument)
 	}
@@ -654,10 +705,10 @@ func (s *PooledService) Generate(ctx context.Context, request GenerateRequest) (
 	if modelID == "" {
 		return nil, fmt.Errorf("%w: GenerateContent model 不能为空", ErrInvalidArgument)
 	}
-	request.System, request.Contents = normalizeTurns(request.System, request.Contents)
-	if s.IgnoreThoughtSignature {
+	if s.shouldIgnoreThoughtSignature() {
 		request.Contents = sanitizeThoughtSignatures(request.Contents)
 	}
+	request.System, request.Contents = normalizeTurns(request.System, request.Contents)
 	if s.YouTubeLinks {
 		request.Contents = attachYouTubeLinks(request.Contents)
 	}

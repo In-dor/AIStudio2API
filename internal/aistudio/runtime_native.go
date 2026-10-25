@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 
@@ -74,7 +75,9 @@ func (worker *NativeWorker) proofAndHeaders(ctx context.Context, binding, page s
 		state.RequestCount++
 		state.LastError = ""
 	})
-	digest := sha256.Sum256([]byte(binding))
+	hasher := sha256.New()
+	_, _ = io.WriteString(hasher, binding)
+	digest := hasher.Sum(nil)
 	proof, err := worker.runtime.Proof(ctx, fmt.Sprintf("%x", digest), page)
 	if err != nil {
 		if ctx.Err() != nil {

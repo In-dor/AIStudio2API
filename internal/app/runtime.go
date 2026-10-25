@@ -128,11 +128,10 @@ func newRuntime(
 		return nil, nil, nil, errors.Join(err, workers.Close())
 	}
 	pooled.BuildNativeNonstream = cfg.BuildNativeNonstream
-	pooled.IgnoreThoughtSignature = cfg.IgnoreThoughtSignature
+	pooled.SetIgnoreThoughtSignature(cfg.IgnoreThoughtSignature)
 	pooled.YouTubeLinks = cfg.YouTubeLinks
 	service := newTrackedService(lifecycle, pooled, pool, requests, workers, cfg.RequestTimeout)
 	service.buildNativeNonstream = cfg.BuildNativeNonstream
-	service.ignoreThoughtSignature = cfg.IgnoreThoughtSignature
 	service.modelMapping, _ = config.ParseModelMapping(cfg.ModelMapping)
 	admin := newRuntimeAdmin(lifecycle, pool, store, service, requests, login, workers, headers, cfg)
 	admin.proxies, admin.globalProxy = proxies, globalProxy
@@ -1904,13 +1903,12 @@ func (provider *accountHeaderProvider) ProtocolHeaders(ctx context.Context, acco
 
 // trackedService 跟踪生成请求及其唯一账户租约
 type trackedService struct {
-	buildNativeNonstream   bool
-	ignoreThoughtSignature bool
-	modelMapping           []config.ModelAlias
-	proxies                *aistudio.ProxyPool
-	rebindAccounts         func([]string)
-	lifecycle              context.Context
-	service                aistudio.Service
+	buildNativeNonstream bool
+	modelMapping         []config.ModelAlias
+	proxies              *aistudio.ProxyPool
+	rebindAccounts       func([]string)
+	lifecycle            context.Context
+	service              aistudio.Service
 	catalog              modelCatalogService
 	pool                 *aistudio.AccountPool
 	requests             *requestRegistry
@@ -2000,9 +1998,8 @@ func (service *trackedService) Running() bool {
 
 // SetIgnoreThoughtSignature 动态更新是否忽略历史思考签名
 func (service *trackedService) SetIgnoreThoughtSignature(enabled bool) {
-	service.ignoreThoughtSignature = enabled
 	if pooled, ok := service.service.(*aistudio.PooledService); ok {
-		pooled.IgnoreThoughtSignature = enabled
+		pooled.SetIgnoreThoughtSignature(enabled)
 	}
 }
 
@@ -2825,6 +2822,9 @@ func (service *trackedService) CountTokens(ctx context.Context, request aistudio
 		return aistudio.TokenCount{}, err
 	}
 	defer cancel()
+	if _, mediaBytes := inlineMediaInput(request.Contents); mediaBytes > 1024*1024 {
+		defer scheduleMemoryRelease()
+	}
 	count, requestErr := service.service.CountTokens(requestCtx, request)
 	api.SetAccessLogError(requestCtx, requestErr)
 	return count, requestErr
@@ -3336,6 +3336,20 @@ func inlineMediaInput(contents []aistudio.Content) (int, int64) {
 	return count, bytes
 }
 
+var memoryReleasePending atomic.Bool
+
+// scheduleMemoryRelease 在大体积媒体请求结束后合并触发一次延迟 GC 与物理内存归还，避免并发请求频繁触发 STW
+func scheduleMemoryRelease() {
+	if !memoryReleasePending.CompareAndSwap(false, true) {
+		return
+	}
+	time.AfterFunc(300*time.Millisecond, func() {
+		defer memoryReleasePending.Store(false)
+		runtime.GC()
+		debug.FreeOSMemory()
+	})
+}
+
 // Generate 获取唯一账户并转发规范事件流
 func (service *trackedService) Generate(ctx context.Context, request aistudio.GenerateRequest) (<-chan aistudio.Event, error) {
 	generationStartedAt := time.Now()
@@ -3767,14 +3781,12 @@ func (service *trackedService) generateWithRetry(
 		cancel()
 		close(destination)
 		if totalMediaBytes > 1024*1024 {
-			go func() {
-				time.Sleep(300 * time.Millisecond)
-				runtime.GC()
-				debug.FreeOSMemory()
-			}()
+			scheduleMemoryRelease()
 		}
 		return
 	}
+	originalContents = nil
+	request.Contents = nil
 	service.forwardEvents(
 		clientCtx, requestCtx, cancel, request.ID,
 		first, source, destination, lease, temporaryCopies, activity, modelID, totalMediaBytes,
@@ -4009,12 +4021,8 @@ func (service *trackedService) forwardEvents(
 		api.SetAccessLogError(requestCtx, requestErr)
 		service.requests.finish(requestID, state, requestErr)
 		close(destination)
-		if mediaBytes > 1024*1024 {
-			go func() {
-				time.Sleep(300 * time.Millisecond)
-				runtime.GC()
-				debug.FreeOSMemory()
-			}()
+		if mediaBytes > 1024*1024 || activity.bytes.Load() > 2*1024*1024 {
+			scheduleMemoryRelease()
 		}
 	}()
 	pendingFirst := true

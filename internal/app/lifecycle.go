@@ -506,16 +506,6 @@ func (manager *runtimeManager) Cooldowns(ctx context.Context) ([]api.AdminCooldo
 	return manager.current.admin.Cooldowns(ctx)
 }
 
-// IgnoreThoughtSignature 返回当前是否忽略历史思考签名
-func (manager *runtimeManager) IgnoreThoughtSignature() bool {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	if tracked, ok := manager.current.service.(*trackedService); ok {
-		return tracked.ignoreThoughtSignature
-	}
-	return false
-}
-
 // ClearCooldown 手动清除账户在一个作用域上的冷却
 func (manager *runtimeManager) ClearCooldown(ctx context.Context, accountID string, scope string) error {
 	manager.mu.RLock()

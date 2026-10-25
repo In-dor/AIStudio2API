@@ -70,3 +70,39 @@ func TestSanitizeThoughtSignatures(t *testing.T) {
 		t.Errorf("expected skip_thought_signature_validator on part, got %s", cleaned[2].Parts[0].ThoughtSignature)
 	}
 }
+
+func TestSanitizeThoughtSignaturesPreservesExternalMediaAndUpload(t *testing.T) {
+	contents := []Content{
+		{
+			Role: RoleUser,
+			Parts: []Part{
+				{
+					ExternalMedia:    &ExternalMedia{MIME: "video/*", URL: "https://www.youtube.com/watch?v=dQw4w9WgXcQ"},
+					ThoughtSignature: "sig-media",
+				},
+				{
+					Upload:           &UploadRef{MIME: "application/pdf", Path: "/upload/1", Name: "doc.pdf", Size: 123},
+					ThoughtSignature: "sig-upload",
+				},
+			},
+		},
+	}
+
+	cleaned := sanitizeThoughtSignatures(contents)
+	if len(cleaned) != 1 || len(cleaned[0].Parts) != 2 {
+		t.Fatalf("expected 1 content with 2 parts, got %+v", cleaned)
+	}
+	if cleaned[0].Parts[0].ExternalMedia == nil || cleaned[0].Parts[0].ThoughtSignature != "" {
+		t.Errorf("external media part corrupted: %+v", cleaned[0].Parts[0])
+	}
+	if cleaned[0].Parts[1].Upload == nil || cleaned[0].Parts[1].ThoughtSignature != "" {
+		t.Errorf("upload part corrupted: %+v", cleaned[0].Parts[1])
+	}
+
+	// Fast-path check: calling sanitizeThoughtSignatures again on already-clean contents should not reallocate
+	again := sanitizeThoughtSignatures(cleaned)
+	if &again[0] != &cleaned[0] {
+		t.Errorf("expected fast-path to return original slice without reallocation")
+	}
+}
+
