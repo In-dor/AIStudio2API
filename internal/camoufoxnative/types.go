@@ -11,7 +11,7 @@ import (
 var ErrAuthenticationRequired = errors.New("隔离登录态失效")
 
 // ErrRegionNotSupported 表示 AI Studio 不支持当前出口地区或账户
-var ErrRegionNotSupported = errors.New("AI Studio 不支持当前出口地区或账户")
+var ErrRegionNotSupported = errors.New("AI Studio 不支持当前出口地区或账户，为该账户或全局代理换用支持地区的出口")
 
 // AvailableRegionsURL 是官网在地区或账户不受支持时跳转的页面
 const AvailableRegionsURL = "https://aistudio.google.com/docs/available-regions"
@@ -49,6 +49,7 @@ type Options struct {
 	ProxyBypass      string
 	Headless         bool
 	TemporaryChat    bool
+	AuthUser         int
 	CacheDirectory   string
 	ReadyTimeout     time.Duration
 	Log              io.Writer

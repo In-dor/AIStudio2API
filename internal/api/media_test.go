@@ -42,7 +42,7 @@ func TestGeminiInlineDataCompatibility(t *testing.T) {
 func TestSpeechWAV(t *testing.T) {
 	pcm := []byte{1, 2, 3, 4}
 	wav := pcmWAV(pcm, 24000, 1)
-	media := aistudio.Media{MIME: "audio/wav", Data: wav}
+	media := aistudio.Blob{MIME: "audio/wav", Data: wav}
 	data, mime, err := encodeSpeechResponse(media, "pcm")
 	if err != nil || !bytes.Equal(data, pcm) || mime != "audio/l16;rate=24000;channels=1" {
 		t.Fatalf("pcm=%v mime=%s err=%v", data, mime, err)
@@ -51,15 +51,36 @@ func TestSpeechWAV(t *testing.T) {
 	if err != nil || !bytes.Equal(data, wav) || mime != "audio/wav" {
 		t.Fatalf("wav mime=%s err=%v", mime, err)
 	}
-	joined, err := joinedAudio([]aistudio.Media{media, media})
+	joined, err := joinedAudio([]aistudio.Blob{media, media})
 	if err != nil || !bytes.Equal(joined.Data, []byte{1, 2, 3, 4, 1, 2, 3, 4}) {
 		t.Fatalf("joined=%v err=%v", joined.Data, err)
 	}
-	if _, err := wavPCM(aistudio.Media{MIME: "audio/wav", Data: wav[:20]}); err == nil {
+	if _, err := wavPCM(aistudio.Blob{MIME: "audio/wav", Data: wav[:20]}); err == nil {
 		t.Fatal("truncated WAV accepted")
 	}
 	content, err := interactionMedia(media, "pcm")
 	if err != nil || content["mime_type"] != "audio/l16" || content["sample_rate"] != 24000 || content["channels"] != 1 {
 		t.Fatalf("interaction audio=%v err=%v", content, err)
+	}
+}
+
+// TestOpenAIVideoContentParts 验证 video_url 与 input_video 支持 data URL、file_id 与 YouTube 链接
+func TestOpenAIVideoContentParts(t *testing.T) {
+	parts, err := openAIContentParts(json.RawMessage(`[
+		{"type":"video_url","video_url":{"url":"data:video/mp4;base64,+//v"}},
+		{"type":"input_video","file_id":"file-123"},
+		{"type":"video_url","video_url":"https://www.youtube.com/watch?v=rOVtjJkqtiA"}
+	]`))
+	if err != nil || len(parts) != 3 {
+		t.Fatalf("parts=%#v err=%v", parts, err)
+	}
+	if parts[0].InlineData == nil || parts[0].InlineData.MIME != "video/mp4" || !bytes.Equal(parts[0].InlineData.Data, []byte{0xfb, 0xff, 0xef}) {
+		t.Fatalf("inline video=%#v", parts[0])
+	}
+	if parts[1].File == nil || parts[1].File.ID != "file-123" {
+		t.Fatalf("file video=%#v", parts[1])
+	}
+	if parts[2].ExternalMedia == nil || parts[2].ExternalMedia.URL != "https://www.youtube.com/watch?v=rOVtjJkqtiA" {
+		t.Fatalf("youtube video=%#v", parts[2])
 	}
 }

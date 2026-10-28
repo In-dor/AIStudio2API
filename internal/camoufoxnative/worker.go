@@ -323,7 +323,11 @@ func (worker *Worker) bootstrap(ctx context.Context, options Options, storage st
 		return err
 	}
 	options.reportStartup(StartupLoadingAIStudio)
-	target := aiStudioOrigin + "/prompts/new_chat?model=" + url.QueryEscape(options.Model)
+	pagePath := "/prompts/new_chat"
+	if options.AuthUser > 0 {
+		pagePath = fmt.Sprintf("/u/%d/prompts/new_chat", options.AuthUser)
+	}
+	target := aiStudioOrigin + pagePath + "?model=" + url.QueryEscape(options.Model)
 	if options.TemporaryChat {
 		target += "&temporary=true"
 	}
@@ -444,7 +448,7 @@ func (worker *Worker) bootstrap(ctx context.Context, options Options, storage st
 	if err != nil {
 		return fmt.Errorf("读取官网 bootstrap 请求正文: %w", err)
 	}
-	if _, err := client.evaluate(ctx, contextID, stopGenerationExpression); err != nil {
+	if err := client.waitFor(ctx, contextID, stopGenerationExpression, 15*time.Second); err != nil {
 		return fmt.Errorf("停止官网 bootstrap 生成: %w", err)
 	}
 	if _, err := client.command(ctx, "network.failRequest", map[string]any{"request": blocked.id}); err != nil {
