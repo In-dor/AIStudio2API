@@ -22,7 +22,9 @@ const schema = `
 CREATE TABLE IF NOT EXISTS prompts (
  id TEXT PRIMARY KEY, title TEXT NOT NULL, model TEXT NOT NULL, description TEXT NOT NULL,
  created INTEGER NOT NULL, updated INTEGER NOT NULL, data BLOB NOT NULL);
-CREATE INDEX IF NOT EXISTS prompts_updated ON prompts(updated);`
+CREATE INDEX IF NOT EXISTS prompts_updated ON prompts(updated);
+CREATE TABLE IF NOT EXISTS system_instructions (
+ id TEXT PRIMARY KEY, title TEXT NOT NULL, text TEXT NOT NULL);`
 
 // summaryColumns 是对话列表项的列
 const summaryColumns = `id, title, model, description, created, updated`
@@ -143,6 +145,37 @@ func (s *Store) DeletePrompt(ctx context.Context, id string) error {
 		return api.ErrPromptNotFound
 	}
 	return sqlitedb.Reclaim(ctx, s.db)
+}
+
+// SystemInstructions 按创建顺序读取保存的系统指令预设
+func (s *Store) SystemInstructions(ctx context.Context) ([]api.SystemInstructionPreset, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, title, text FROM system_instructions ORDER BY rowid`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	presets := []api.SystemInstructionPreset{}
+	for rows.Next() {
+		var preset api.SystemInstructionPreset
+		if err := rows.Scan(&preset.ID, &preset.Title, &preset.Text); err != nil {
+			return nil, err
+		}
+		presets = append(presets, preset)
+	}
+	return presets, rows.Err()
+}
+
+// SaveSystemInstruction 新增或改写一条系统指令预设
+func (s *Store) SaveSystemInstruction(ctx context.Context, preset api.SystemInstructionPreset) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO system_instructions (id, title, text) VALUES (?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET title = excluded.title, text = excluded.text`, preset.ID, preset.Title, preset.Text)
+	return err
+}
+
+// DeleteSystemInstruction 删除一条系统指令预设
+func (s *Store) DeleteSystemInstruction(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM system_instructions WHERE id = ?`, id)
+	return err
 }
 
 // scanSummary 读取一行对话列表项，没有行时返回 api.ErrPromptNotFound

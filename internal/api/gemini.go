@@ -95,9 +95,7 @@ type geminiPart struct {
 	Thought          bool            `json:"thought"`
 	ThoughtSignature string          `json:"thoughtSignature"`
 	InlineData       *geminiBlobPart `json:"inlineData"`
-	InlineDataSnake  *geminiBlobPart `json:"inline_data"`
 	FileData         *geminiFilePart `json:"fileData"`
-	FileDataSnake    *geminiFilePart `json:"file_data"`
 	FunctionCall     *struct {
 		ID   string          `json:"id"`
 		Name string          `json:"name"`
@@ -112,7 +110,6 @@ type geminiPart struct {
 	ExecutableCode      *aistudio.ExecutableCode      `json:"executableCode"`
 	CodeExecutionResult *aistudio.CodeExecutionResult `json:"codeExecutionResult"`
 	SpeechMetadata      *aistudio.SpeechMetadata      `json:"speechMetadata"`
-	SpeechMetadataSnake *aistudio.SpeechMetadata      `json:"speech_metadata"`
 	VideoMetadata       *geminiVideoMetadata          `json:"videoMetadata"`
 	MediaProcessing     string                        `json:"mediaProcessing"`
 	ToolCall            *geminiToolStep               `json:"toolCall"`
@@ -148,27 +145,10 @@ func (step geminiToolStep) step(payload json.RawMessage) *aistudio.ServerToolSte
 
 func (p geminiPart) speechMetadata() *aistudio.SpeechMetadata {
 	metadata := p.SpeechMetadata
-	if metadata == nil {
-		metadata = p.SpeechMetadataSnake
-	}
 	if metadata == nil || strings.TrimSpace(metadata.Speaker) == "" && strings.TrimSpace(metadata.Style) == "" {
 		return nil
 	}
 	return &aistudio.SpeechMetadata{Speaker: strings.TrimSpace(metadata.Speaker), Style: strings.TrimSpace(metadata.Style)}
-}
-
-func (p geminiPart) inline() *geminiBlobPart {
-	if p.InlineData != nil {
-		return p.InlineData
-	}
-	return p.InlineDataSnake
-}
-
-func (p geminiPart) file() *geminiFilePart {
-	if p.FileData != nil {
-		return p.FileData
-	}
-	return p.FileDataSnake
 }
 
 type geminiGenerationConfig struct {
@@ -245,9 +225,9 @@ type geminiResponseFormats []geminiResponseFormat
 
 // UnmarshalJSON 按单个对象或数组读取 responseFormat
 func (formats *geminiResponseFormats) UnmarshalJSON(data []byte) error {
-	if trimmed := bytes.TrimSpace(data); len(trimmed) > 0 && trimmed[0] == '{' {
+	if data[0] == '{' {
 		var format geminiResponseFormat
-		if err := json.Unmarshal(trimmed, &format); err != nil {
+		if err := json.Unmarshal(data, &format); err != nil {
 			return err
 		}
 		*formats = geminiResponseFormats{format}
@@ -375,6 +355,7 @@ func (s *server) handleGeminiModels(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	models = s.searchModels(models)
 	page, next, err := geminiPage(r.URL.Query(), models, 50, 1000)
 	if err != nil {
 		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
@@ -426,7 +407,7 @@ func (s *server) handleGeminiModel(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if model, ok := LookupPublicModel(models, modelID); ok {
+	if model, ok := LookupPublicModel(s.searchModels(models), modelID); ok {
 		writeJSON(w, http.StatusOK, officialOrder("gemini", geminiModelObject(model)))
 		return
 	}
@@ -498,19 +479,15 @@ func (s *server) handleGeminiAction(w http.ResponseWriter, r *http.Request) {
 	case "predictLongRunning":
 		s.handleGeminiVideoCreate(w, r, model)
 		return
+	case "predict":
+		s.handleGeminiPredict(w, r, model)
+		return
 	case "embedContent", "batchEmbedContents":
 		s.handleGeminiEmbed(w, r, model, method == "batchEmbedContents")
 		return
 	}
 	var request geminiRequest
-	body, err := io.ReadAll(r.Body)
-	if err == nil {
-		body, _, err = geminiCamelKeys(body)
-	}
-	if err == nil {
-		err = json.Unmarshal(body, &request)
-	}
-	if err != nil {
+	if err := decodeGeminiJSON(r, &request); err != nil {
 		writeGeminiError(w, http.StatusBadRequest, "INVALID_ARGUMENT", err.Error())
 		return
 	}
@@ -554,6 +531,18 @@ func (s *server) handleGeminiAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.handleGeminiGenerate(w, r, generateRequest, method == "streamGenerateContent", request.GenerationConfig.candidates(), audio)
+}
+
+// decodeGeminiJSON 读取请求体，按 proto3 JSON 规则统一字段名后解码到 target
+func decodeGeminiJSON(r *http.Request, target any) error {
+	body, err := io.ReadAll(r.Body)
+	if err == nil {
+		body, _, err = geminiCamelKeys(body)
+	}
+	if err == nil {
+		err = json.Unmarshal(body, target)
+	}
+	return err
 }
 
 // geminiFilesAPIURI 返回 URI 是否指向 Gemini Files API 的文件资源
@@ -930,11 +919,11 @@ func mapGeminiParts(input []geminiPart) ([]aistudio.Part, bool, error) {
 		if part.Text != nil {
 			variants++
 		}
-		inline := part.inline()
+		inline := part.InlineData
 		if inline != nil {
 			variants++
 		}
-		file := part.file()
+		file := part.FileData
 		if file != nil {
 			variants++
 		}
@@ -988,7 +977,6 @@ func mapGeminiParts(input []geminiPart) ([]aistudio.Part, bool, error) {
 			})
 		case file != nil:
 			uri := file.URI()
-			mime := file.MIME()
 			if uri == "" {
 				return nil, false, fmt.Errorf("fileData requires fileUri")
 			}
@@ -1003,7 +991,7 @@ func mapGeminiParts(input []geminiPart) ([]aistudio.Part, bool, error) {
 			} else {
 				parts = append(parts, aistudio.Part{
 					File: &aistudio.FileRef{
-						ID: uri, Name: file.DisplayName, MIME: mime,
+						ID: uri, Name: file.DisplayName, MIME: file.MIME(),
 					},
 					ThoughtSignature: part.ThoughtSignature,
 					VideoMetadata:    video, MediaProcessing: processing, MediaResolution: resolution,
@@ -1076,7 +1064,7 @@ func geminiJSONObject(raw json.RawMessage, field string) (json.RawMessage, error
 }
 
 func mapGeminiGoogleSearch(raw json.RawMessage) (*aistudio.GoogleSearchOptions, error) {
-	if !geminiRawObjectPresent(raw) {
+	if !rawJSONConfigured(raw) {
 		return nil, nil
 	}
 	var config struct {
@@ -1096,8 +1084,8 @@ func mapGeminiGoogleSearch(raw json.RawMessage) (*aistudio.GoogleSearchOptions, 
 	if config.SearchTypes == nil {
 		options.WebSearch = true
 	} else {
-		options.WebSearch = geminiRawObjectPresent(config.SearchTypes.WebSearch)
-		options.ImageSearch = geminiRawObjectPresent(config.SearchTypes.ImageSearch)
+		options.WebSearch = rawJSONConfigured(config.SearchTypes.WebSearch)
+		options.ImageSearch = rawJSONConfigured(config.SearchTypes.ImageSearch)
 		if !options.WebSearch && !options.ImageSearch {
 			options.WebSearch = true
 		}
@@ -1121,10 +1109,6 @@ func mapGeminiGoogleSearch(raw json.RawMessage) (*aistudio.GoogleSearchOptions, 
 		options.TimeRange = timeRange
 	}
 	return options, nil
-}
-
-func geminiRawObjectPresent(raw json.RawMessage) bool {
-	return len(raw) > 0 && strings.TrimSpace(string(raw)) != "null"
 }
 
 func mapGeminiTools(groups []geminiToolGroup, config geminiToolConfig) (aistudio.Tools, error) {
@@ -1170,16 +1154,16 @@ func mapGeminiTools(groups []geminiToolGroup, config geminiToolConfig) (aistudio
 				}
 			}
 		}
-		if geminiRawObjectPresent(group.GoogleSearchRetrieval) {
+		if rawJSONConfigured(group.GoogleSearchRetrieval) {
 			mapped.Google = appendUnique(mapped.Google, "google_search")
 		}
-		if geminiRawObjectPresent(group.URLContext) {
+		if rawJSONConfigured(group.URLContext) {
 			mapped.Google = appendUnique(mapped.Google, "url_context")
 		}
-		if geminiRawObjectPresent(group.CodeExecution) {
+		if rawJSONConfigured(group.CodeExecution) {
 			mapped.Google = appendUnique(mapped.Google, "code_execution")
 		}
-		if geminiRawObjectPresent(group.GoogleMaps) {
+		if rawJSONConfigured(group.GoogleMaps) {
 			mapped.Google = appendUnique(mapped.Google, "google_maps")
 			var maps struct {
 				EnableWidget bool `json:"enableWidget"`
@@ -1189,7 +1173,7 @@ func mapGeminiTools(groups []geminiToolGroup, config geminiToolConfig) (aistudio
 			}
 			mapped.MapsWidget = mapped.MapsWidget || maps.EnableWidget
 		}
-		if geminiRawObjectPresent(group.ImageSearch) {
+		if rawJSONConfigured(group.ImageSearch) {
 			mapped.Google = appendUnique(mapped.Google, "image_search")
 		}
 		if computer := group.ComputerUse; computer != nil {
@@ -1204,7 +1188,7 @@ func mapGeminiTools(groups []geminiToolGroup, config geminiToolConfig) (aistudio
 				SSEReadTimeout: server.Transport.SSEReadTimeout, TerminateOnClose: server.Transport.TerminateOnClose,
 			})
 		}
-		if geminiRawObjectPresent(group.FileSearch) {
+		if rawJSONConfigured(group.FileSearch) {
 			mapped.FileSearch = group.FileSearch
 		}
 	}
@@ -1240,6 +1224,7 @@ func mapGeminiTools(groups []geminiToolGroup, config geminiToolConfig) (aistudio
 
 // handleGeminiCountTokens 统计请求的输入 token 数，引用显式缓存时另给出缓存部分的 token 数
 func (s *server) handleGeminiCountTokens(w http.ResponseWriter, r *http.Request, request aistudio.GenerateRequest, cache *geminiCache) {
+	request = s.prepareSearch(request)
 	count, err := s.service.CountTokens(r.Context(), aistudio.TokenCountRequest{
 		Model: request.Model, System: request.System, Contents: request.Contents, Tools: request.Tools,
 		MediaResolution: request.Config.MediaResolution,
@@ -1280,6 +1265,7 @@ func (s *server) handleGeminiCountTokens(w http.ResponseWriter, r *http.Request,
 
 // handleGeminiGenerate 为每个候选启动一次生成，任一候选失败时整个请求按首个错误失败，audio 非空时音频按 responseFormat.audio 转换
 func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, request aistudio.GenerateRequest, stream bool, count int, audio *outputAudioFormat) {
+	request = s.prepareSearch(request)
 	request.Unary = !stream || s.responseModes().FakeStream
 	if !stream {
 		var stopKeepalive func()
@@ -1298,7 +1284,7 @@ func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 	results, err := candidates.run(func(_ int, events <-chan aistudio.Event) (generationResult, error) {
-		result, err := consumeEvents(candidates.ctx, events, nil)
+		result, err := consumeEvents(candidates.ctx, events)
 		if err == nil && audio != nil {
 			err = result.convertAudio(*audio)
 		}
@@ -1365,11 +1351,8 @@ func buildGeminiResponse(request aistudio.GenerateRequest, results []generationR
 	}
 	response := map[string]any{
 		"candidates":   candidates,
-		"modelVersion": request.Model,
+		"modelVersion": cmp.Or(results[0].providerModel, request.Model),
 		"responseId":   cmp.Or(results[0].responseID, request.ID),
-	}
-	if results[0].providerModel != "" {
-		response["modelVersion"] = results[0].providerModel
 	}
 	if results[0].turnToken != "" {
 		response["turnToken"] = results[0].turnToken
@@ -1676,7 +1659,7 @@ func setGeminiCandidateEnd(candidate map[string]any, result generationResult) {
 	}
 	citations := make([]aistudio.Citation, 0)
 	for _, event := range result.events {
-		if event.Kind == aistudio.EventCitation && event.Citation != nil {
+		if event.Kind == aistudio.EventCitation {
 			citations = append(citations, *event.Citation)
 		}
 	}
@@ -1872,10 +1855,6 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 		return
 	}
 	candidates.record(r.Context(), results)
-	model := request.Model
-	if results[0].providerModel != "" {
-		model = results[0].providerModel
-	}
 	finished := make([]any, 0, len(results))
 	for index, result := range results {
 		candidate := map[string]any{"index": index, "content": map[string]any{"role": "model", "parts": append([]any{}, finalParts[index]...)}}
@@ -1883,7 +1862,7 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 		finished = append(finished, candidate)
 	}
 	final := map[string]any{
-		"responseId": cmp.Or(results[0].responseID, request.ID), "modelVersion": model,
+		"responseId": cmp.Or(results[0].responseID, request.ID), "modelVersion": cmp.Or(results[0].providerModel, request.Model),
 		"candidates": finished,
 	}
 	if results[0].turnToken != "" {

@@ -1,3 +1,4 @@
+import { markRaw } from 'vue'
 import MarkdownIt, { type Env, type Token } from 'markdown-it'
 import katexPlugin from '@vscode/markdown-it-katex'
 import './katex.scss'
@@ -7,13 +8,10 @@ import type { Support } from './types'
 const markdown = new MarkdownIt({ linkify: true, breaks: false, html: false })
 const katex = (katexPlugin as unknown as { default?: typeof katexPlugin }).default ?? katexPlugin
 markdown.use(katex, { throwOnError: false, enableBareBlocks: true })
-const renderLink =
-  markdown.renderer.rules.link_open ??
-  ((tokens, index, options, _env, self) => self.renderToken(tokens, index, options))
-markdown.renderer.rules.link_open = (tokens, index, options, env, self) => {
-  tokens[index]?.attrSet('target', '_blank')
-  tokens[index]?.attrSet('rel', 'noopener noreferrer')
-  return renderLink(tokens, index, options, env, self)
+markdown.renderer.rules.link_open = (tokens, index, options, _env, self) => {
+  tokens[index]!.attrSet('target', '_blank')
+  tokens[index]!.attrSet('rel', 'noopener noreferrer')
+  return self.renderToken(tokens, index, options)
 }
 
 // MarkdownNode 是正文的渲染节点：块元素、块内行内 HTML、代码块或整段 HTML 的块
@@ -62,7 +60,7 @@ function buildNodes(tokens: Token[], env: Env): MarkdownNode[] {
       children.push({
         kind: 'code',
         code: token.content.replace(/\n$/, ''),
-        language: token.info.trim().split(/\s+/)[0]?.toLowerCase() ?? '',
+        language: token.info.trim().split(/\s+/)[0]!.toLowerCase(),
       })
     } else if (token.type === 'hr') {
       children.push({ kind: 'element', tag: 'hr', attrs: {}, children: [] })
@@ -96,11 +94,13 @@ function parseBlocks(text: string, base: number, firstKey: number, env: Env): Bl
     if (depth !== 0) continue
     const group = tokens.slice(start, index + 1)
     const line = group[0]?.map?.[0] ?? 0
-    blocks.push({
-      key: firstKey + blocks.length,
-      offset: base + (offsets[line] ?? 0),
-      nodes: buildNodes(group, env),
-    })
+    blocks.push(
+      markRaw({
+        key: firstKey + blocks.length,
+        offset: base + (offsets[line] ?? 0),
+        nodes: markRaw(buildNodes(group, env)),
+      }),
+    )
     start = index + 1
   }
   return blocks

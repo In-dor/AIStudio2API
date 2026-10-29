@@ -2,7 +2,9 @@ package api
 
 import (
 	"encoding/json"
+	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -234,6 +236,31 @@ func TestGeminiGroundingMetadataInResponse(t *testing.T) {
 	cand := candidates[0].(map[string]any)
 	if cand["groundingMetadata"] == nil {
 		t.Fatalf("expected groundingMetadata in candidate, got %#v", cand)
+	}
+}
+
+func TestDecodeGeminiJSON_InlineDataSnakeCase(t *testing.T) {
+	raw := `{"contents":[{"role":"user","parts":[{"inline_data":{"mime_type":"image/png","data":"aGVsbG8="}}]}]}`
+	req := httptest.NewRequest("POST", "/v1beta/models/gemini-2.5-flash:generateContent", strings.NewReader(raw))
+	var geminiReq geminiRequest
+	if err := decodeGeminiJSON(req, &geminiReq); err != nil {
+		t.Fatalf("decodeGeminiJSON failed: %v", err)
+	}
+	if len(geminiReq.Contents) != 1 || len(geminiReq.Contents[0].Parts) != 1 {
+		t.Fatalf("unexpected contents: %+v", geminiReq.Contents)
+	}
+	parts, _, err := mapGeminiParts(geminiReq.Contents[0].Parts)
+	if err != nil {
+		t.Fatalf("mapGeminiParts failed: %v", err)
+	}
+	if len(parts) != 1 || parts[0].InlineData == nil {
+		t.Fatalf("expected 1 part with inline data, got %+v", parts)
+	}
+	if parts[0].InlineData.MIME != "image/png" {
+		t.Errorf("expected MIME image/png, got %s", parts[0].InlineData.MIME)
+	}
+	if string(parts[0].InlineData.Data) != "hello" {
+		t.Errorf("expected data hello, got %s", string(parts[0].InlineData.Data))
 	}
 }
 

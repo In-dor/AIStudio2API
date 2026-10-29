@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { vTooltip } from '@/playground/ui/tooltip'
 import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n, type TranslationKey } from '@/i18n'
@@ -42,10 +41,42 @@ const schemaOpen = ref(false)
 const functionsOpen = ref(false)
 const codeOpen = ref(false)
 const stopDraft = ref('')
+const samplingPreset = ref('custom')
 
 const settings = computed(() => session.settings)
 const model = computed(() => currentModel.value)
 const can = (code: number) => hasCode(model.value, code)
+// samplingPresets 是一次设定温度、Top P 与 Top K 的采样组合
+const samplingPresets = [
+  { value: 'code', label: 'pg.samplingCode', temperature: 0.1, topP: 0.1, topK: 4 },
+  { value: 'balanced', label: 'pg.samplingBalanced', temperature: 1, topP: 0.95, topK: 64 },
+  { value: 'creative', label: 'pg.samplingCreative', temperature: 1.1, topP: 0.95, topK: 64 },
+] as const
+
+// applySamplingPreset 设置采样组合，温度不超过模型上限，自定义保留当前值
+function applySamplingPreset(value: string): void {
+  const preset = samplingPresets.find((item) => item.value === value)
+  if (preset) {
+    settings.value.temperature = Math.min(preset.temperature, model.value?.max_temperature ?? 1)
+    settings.value.topP = preset.topP
+    settings.value.topK = preset.topK
+  }
+  samplingPreset.value = value
+}
+
+watch(
+  [
+    settings,
+    () => settings.value.model,
+    () => settings.value.temperature,
+    () => settings.value.topP,
+    () => settings.value.topK,
+  ],
+  () => {
+    samplingPreset.value = 'custom'
+  },
+  { flush: 'sync' },
+)
 // supports 判断所选协议能否表达某项设置
 const supports = (setting: ProtocolSetting) => protocolSupports(settings.value.protocol, setting)
 // protocolTip 是所选协议不支持某项设置时的说明
@@ -104,8 +135,7 @@ function selectModel(model: Model): void {
 
 // setVideoDuration 设置视频时长，与默认值相同时不发送
 function setVideoDuration(value: number): void {
-  if (!videoOptions.value) return
-  const { min, max, initial } = videoOptions.value.duration
+  const { min, max, initial } = videoOptions.value!.duration
   const seconds = Math.min(max, Math.max(min, Math.round(value)))
   settings.value.videoDuration = seconds === initial ? null : seconds
 }
@@ -605,6 +635,20 @@ watch(schemaOpen, (open) => {
           <UiIcon name="chevronDown" :size="20" class="expand-icon" />
         </button>
         <template v-if="advancedOpen">
+          <div v-if="!can(Capability.FixedTemperature)" class="settings-item-column">
+            <h3 class="item-description-title">{{ t('pg.samplingPreset') }}</h3>
+            <UiSelect
+              :model-value="samplingPreset"
+              class="w-full"
+              :aria-label="t('pg.samplingPreset')"
+              @update:model-value="applySamplingPreset(String($event))"
+            >
+              <option value="custom">{{ t('pg.samplingCustom') }}</option>
+              <option v-for="preset in samplingPresets" :key="preset.value" :value="preset.value">
+                {{ t(preset.label) }}
+              </option>
+            </UiSelect>
+          </div>
           <div
             v-if="can(Capability.MediaResolution)"
             v-tooltip.left="settingTip('mediaResolution', t('pg.mediaResolutionTip'))"
@@ -693,33 +737,66 @@ watch(schemaOpen, (open) => {
               :value="settings.maxOutputTokens ?? outputLimit(model)"
               @change="setOutputLength"
             />
-            <p v-if="model?.capabilities?.output_continuation" class="output-length-hint">
+            <p v-if="model?.capabilities?.output_continuation" class="setting-hint">
               {{ t('pg.outputContinuation') }}
             </p>
           </div>
           <div
-            v-if="can(Capability.TopK)"
-            v-tooltip.left="settingTip('topK', t('pg.topKTip'))"
-            class="settings-item"
-          >
-            <h3 class="item-description-title">{{ t('pg.topK') }}</h3>
-            <input
-              ms-input
-              class="small number-input"
-              type="number"
-              min="1"
-              step="1"
-              :disabled="!supports('topK')"
-              :aria-label="t('pg.topK')"
-              :value="settings.topK"
-              @change="setTopK"
-            />
-          </div>
-          <div
-            v-if="can(Capability.TopP)"
-            v-tooltip.left="t('pg.topPTip')"
+            v-if="!can(Capability.Temperature)"
+            v-tooltip.left="t('pg.temperatureTip')"
             class="settings-item-column"
           >
+            <h3 class="item-description-title">{{ t('pg.temperature') }}</h3>
+            <div class="ms-slider">
+              <UiSlider
+                :model-value="settings.temperature ?? model?.temperature ?? 1"
+                :min="0"
+                :max="model?.max_temperature ?? 1"
+                :step="0.05"
+                :label="t('pg.temperature')"
+                @update:model-value="settings.temperature = $event"
+              />
+              <input
+                ms-input
+                class="small slider-number-input"
+                type="number"
+                :min="0"
+                :max="model?.max_temperature ?? 1"
+                step="0.05"
+                :aria-label="t('pg.temperature')"
+                :value="settings.temperature ?? model?.temperature ?? 1"
+                @change="settings.temperature = numberInput($event)"
+              />
+            </div>
+            <p class="setting-hint">{{ t('pg.samplingIgnored') }}</p>
+          </div>
+          <div v-tooltip.left="settingTip('topK', t('pg.topKTip'))" class="settings-item-column">
+            <h3 class="item-description-title">{{ t('pg.topK') }}</h3>
+            <div class="ms-slider">
+              <UiSlider
+                :model-value="settings.topK ?? model?.top_k ?? 64"
+                :min="1"
+                :max="128"
+                :step="1"
+                :disabled="!supports('topK')"
+                :label="t('pg.topK')"
+                @update:model-value="settings.topK = $event"
+              />
+              <input
+                ms-input
+                class="small slider-number-input"
+                type="number"
+                min="1"
+                step="1"
+                :disabled="!supports('topK')"
+                :aria-label="t('pg.topK')"
+                :value="settings.topK ?? model?.top_k ?? 64"
+                @change="setTopK"
+              />
+            </div>
+            <p v-if="!can(Capability.TopK)" class="setting-hint">{{ t('pg.samplingIgnored') }}</p>
+          </div>
+          <div v-tooltip.left="t('pg.topPTip')" class="settings-item-column">
             <h3 class="item-description-title">{{ t('pg.topP') }}</h3>
             <div class="ms-slider">
               <UiSlider
@@ -742,6 +819,7 @@ watch(schemaOpen, (open) => {
                 @change="settings.topP = numberInput($event)"
               />
             </div>
+            <p v-if="!can(Capability.TopP)" class="setting-hint">{{ t('pg.samplingIgnored') }}</p>
           </div>
           <div v-if="videoOptions" class="settings-item-column">
             <h3 class="item-description-title">{{ t('pg.videoTask') }}</h3>
@@ -752,7 +830,7 @@ watch(schemaOpen, (open) => {
             >
               <option value="">{{ t('pg.videoTaskUnspecified') }}</option>
               <option v-for="task in videoOptions.tasks" :key="task" :value="task">
-                {{ t(videoTaskLabels[task] ?? 'pg.videoTaskUnspecified') }}
+                {{ t(videoTaskLabels[task]!) }}
               </option>
             </UiSelect>
           </div>
@@ -1030,15 +1108,11 @@ watch(schemaOpen, (open) => {
   flex-wrap: wrap;
 }
 
-.output-length-hint {
+.setting-hint {
   width: 100%;
   margin: 4px 0 0;
   color: var(--color-v3-text-var);
   font-size: 12px;
   line-height: 18px;
-}
-
-.number-input {
-  --ms-input-width: 80px;
 }
 </style>

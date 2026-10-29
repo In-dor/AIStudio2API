@@ -14,8 +14,15 @@ import { api, ApiError } from '@/api'
 import { useConsole } from '@/console'
 import { keepPage } from '@/desktop'
 import { useI18n } from '@/i18n'
-import type { Model, SavedPrompt } from '@/types'
-import { defaultChatModel, hasCode, toolCodes, toolCompatible, type Tool } from './catalog'
+import type { Model, SavedPrompt, SystemInstructionPreset } from '@/types'
+import {
+  Capability,
+  defaultChatModel,
+  hasCode,
+  toolCodes,
+  toolCompatible,
+  type Tool,
+} from './catalog'
 import { readImage } from './media/api'
 import { generate, protocolsFor } from './protocols'
 import { apiKey, apiPart, appendParts, buildRequest, countTokens, failureText } from './request'
@@ -56,13 +63,13 @@ export function outputLimit(model: Model | undefined): number | undefined {
     : model?.output_token_limit
 }
 
-// modelDefaults 返回随模型变化的运行设置默认值
+// modelDefaults 返回随模型变化的运行设置默认值，官网面板隐藏的采样参数默认不发送
 function modelDefaults(model: Model | undefined): Partial<RunSettings> {
   return {
     model: model?.id ?? '',
-    temperature: model?.temperature ?? null,
-    topP: model?.top_p ?? null,
-    topK: model?.top_k ?? null,
+    temperature: hasCode(model, Capability.Temperature) ? (model?.temperature ?? null) : null,
+    topP: hasCode(model, Capability.TopP) ? (model?.top_p ?? null) : null,
+    topK: hasCode(model, Capability.TopK) ? (model?.top_k ?? null) : null,
     maxOutputTokens: model?.output_token_limit ?? null,
     thinkingLevel: model?.default_thinking_level ?? null,
     thinkingBudget: -1,
@@ -126,7 +133,7 @@ export function newTurnID(): string {
 }
 
 // SaveState 是对话保存状态
-export type SaveState = 'idle' | 'saving' | 'saved' | 'error'
+type SaveState = 'idle' | 'saving' | 'saved' | 'error'
 
 // cloneData 以 JSON 往返复制对话数据，嵌套的响应式对象一并复制为普通对象
 function cloneData<T>(value: T): T {
@@ -268,7 +275,13 @@ function createSession(temporary = false, links: SessionLinks = {}) {
   // save 把调用时的对话连同对比模式的右侧窗格写入对话库，右侧窗格保存所在的页面对话，其他临时对话不保存；保存状态只回写到仍在显示的同一对话
   async function save(): Promise<void> {
     if (links.save) return links.save()
-    if (session.temporary || session.turns.length === 0) return
+    if (
+      session.temporary ||
+      (session.id === null &&
+        session.turns.length === 0 &&
+        session.settings.systemInstruction.trim() === '')
+    )
+      return
     const compare = links.compare?.()
     session.id ??= newTurnID()
     const id = session.id
@@ -288,6 +301,7 @@ function createSession(temporary = false, links: SessionLinks = {}) {
 
   // scheduleSave 在对话变化后合并保存，生成中到时的保存由生成结束时的保存代替
   function scheduleSave(): void {
+    if (session.saveState === 'saved') session.saveState = 'idle'
     window.clearTimeout(saveTimer.value)
     saveTimer.value = window.setTimeout(() => {
       saveTimer.value = 0
@@ -361,7 +375,6 @@ function createSession(temporary = false, links: SessionLinks = {}) {
 
   // submit 发送输入框内容；输入为空且最后一轮为用户轮次时直接运行
   async function submit(): Promise<void> {
-    if (session.running) return
     if (!append() && session.turns.at(-1)?.role !== 'user') return
     await run()
   }
@@ -471,15 +484,12 @@ function createSession(temporary = false, links: SessionLinks = {}) {
   // rerun 从某一轮重新生成：模型轮次替换自身，用户轮次替换其后的回复
   function rerun(index: number): void {
     if (session.running) return
-    const turn = session.turns[index]
-    if (turn === undefined) return
-    session.turns.splice(turn.role === 'model' ? index : index + 1)
+    session.turns.splice(session.turns[index]!.role === 'model' ? index : index + 1)
     void run()
   }
 
   // respond 以用户填写的函数响应继续生成：响应为 JSON 对象时原样发送，否则作为 result 字段发送
   function respond(call: NonNullable<Part['functionCall']>, text: string): void {
-    if (session.running) return
     let response: Record<string, unknown>
     try {
       const value: unknown = JSON.parse(text)
@@ -503,8 +513,7 @@ function createSession(temporary = false, links: SessionLinks = {}) {
 
   // editTurn 用新文本替换某一轮的文本片段
   function editTurn(index: number, text: string): void {
-    const turn = session.turns[index]
-    if (turn === undefined) return
+    const turn = session.turns[index]!
     const others = turn.parts.filter((part) => part.text === undefined || part.thought)
     turn.parts = text === '' ? others : [...others, { text }]
     scheduleSave()
@@ -582,7 +591,7 @@ function createSession(temporary = false, links: SessionLinks = {}) {
       () => [session.settings, session.temporary] as const,
       ([settings], [previous]) => {
         if (settings !== previous && settings === opened) return
-        if (session.id !== null && !session.running) scheduleSave()
+        if ((session.id !== null || session.turns.length > 0) && !session.running) scheduleSave()
       },
       { deep: true },
     )
@@ -725,8 +734,8 @@ watch(
 // setSync 与官网一致切换系统指令同步，开启时把 index 窗格的系统指令写入右侧窗格
 function setSync(index: number, value: boolean): void {
   syncInstructions.value = value
-  const text = panes[index]?.session.settings.systemInstruction
-  if (!value || text === undefined) return
+  if (!value) return
+  const text = panes[index]!.session.settings.systemInstruction
   for (const pane of panes.slice(1)) pane.session.settings.systemInstruction = text
 }
 
@@ -761,8 +770,7 @@ function leaveCompare(): void {
 
 // closePane 关闭一个窗格：关闭左侧时右侧的对话与运行设置成为页面对话
 function closePane(index: number): void {
-  const right = panes[1]
-  if (right === undefined) return
+  const right = panes[1]!
   if (index === 0) {
     main.stop()
     right.stop()
@@ -835,4 +843,133 @@ export function useCompare() {
     stopAll,
     toggleRaw,
   }
+}
+
+// localPresetsKey 是浏览器本机保存系统指令预设的键，读取时并入对话库后删除
+const localPresetsKey = 'playground_system_instructions'
+
+// useInstructionPresets 管理保存在对话库中的系统指令预设
+export function useInstructionPresets(
+  open: () => boolean,
+  getText: () => string,
+  setText: (value: string) => void,
+) {
+  const presets = ref<SystemInstructionPreset[]>([])
+  const selected = ref('')
+  const title = ref('')
+  const saved = ref(true)
+  const saveError = ref(false)
+  const { errorText } = useI18n()
+  const { showNotice } = useConsole()
+  let saveTimer = 0
+
+  // currentPreset 是当前选中的系统指令预设
+  const currentPreset = computed(() => presets.value.find((preset) => preset.id === selected.value))
+
+  // syncSelection 按当前系统指令匹配预设选中态
+  function syncSelection(): void {
+    const match = presets.value.find((preset) => preset.text === getText())
+    selected.value = match?.id ?? ''
+    title.value = match?.title ?? ''
+  }
+
+  // persist 等待一次预设写入并更新保存状态
+  async function persist(write: Promise<void>): Promise<void> {
+    saved.value = false
+    saveError.value = false
+    try {
+      await write
+      saved.value = saveTimer === 0
+    } catch (cause) {
+      saveError.value = true
+      showNotice(errorText(cause), 'error')
+    }
+  }
+
+  // commit 把当前标题与系统指令写入预设列表并保存
+  function commit(): void {
+    const text = getText()
+    if (text.trim() === '' && title.value.trim() === '') {
+      saved.value = true
+      return
+    }
+    let preset = currentPreset.value
+    if (preset === undefined) {
+      preset = { id: newTurnID(), title: '', text: '' }
+      presets.value.push(preset)
+      selected.value = preset.id
+    }
+    preset.title = title.value
+    preset.text = text
+    void persist(api.saveSystemInstruction(preset))
+  }
+
+  // flush 立即提交待保存的系统指令预设
+  function flush(): void {
+    if (saveTimer === 0) return
+    window.clearTimeout(saveTimer)
+    saveTimer = 0
+    commit()
+  }
+
+  // remember 在编辑后合并保存当前指令到预设
+  function remember(): void {
+    saved.value = false
+    saveError.value = false
+    window.clearTimeout(saveTimer)
+    saveTimer = window.setTimeout(() => {
+      saveTimer = 0
+      commit()
+    }, 500)
+  }
+
+  // choose 切换到另一条预设或新建空白指令
+  function choose(id: string | number | undefined): void {
+    flush()
+    selected.value = String(id ?? '')
+    const preset = currentPreset.value
+    title.value = preset?.title ?? ''
+    setText(preset?.text ?? '')
+  }
+
+  // remove 删除当前预设并清空指令
+  function remove(): void {
+    window.clearTimeout(saveTimer)
+    saveTimer = 0
+    const id = selected.value
+    presets.value = presets.value.filter((preset) => preset.id !== id)
+    void persist(api.deleteSystemInstruction(id))
+    choose('')
+  }
+
+  // refresh 从服务端读取预设，并入浏览器本机保存的预设后匹配当前指令
+  async function refresh(): Promise<void> {
+    try {
+      presets.value = await api.systemInstructions()
+      const local = localStorage.getItem(localPresetsKey)
+      if (local !== null) {
+        const remote = presets.value
+        const missing = (JSON.parse(local) as SystemInstructionPreset[]).filter(
+          (item) =>
+            !remote.some(
+              (preset) =>
+                preset.id === item.id || (preset.title === item.title && preset.text === item.text),
+            ),
+        )
+        for (const preset of missing) await api.saveSystemInstruction(preset)
+        presets.value = [...remote, ...missing]
+        localStorage.removeItem(localPresetsKey)
+      }
+      syncSelection()
+    } catch (cause) {
+      showNotice(errorText(cause), 'error')
+    }
+  }
+
+  watch(open, (value) => {
+    if (value) void refresh()
+    else flush()
+  })
+
+  return { presets, selected, title, saved, saveError, currentPreset, remember, choose, remove }
 }
