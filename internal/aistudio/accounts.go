@@ -2616,9 +2616,22 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 	}
 	if len(selection.InlineMediaKeys) > 0 && len(indices) > 1 {
 		now := time.Now().UTC()
-		sort.SliceStable(indices, func(i, j int) bool {
-			return p.inlineMediaHitsLocked(p.accounts[indices[i]], selection.InlineMediaKeys, now) >
-				p.inlineMediaHitsLocked(p.accounts[indices[j]], selection.InlineMediaKeys, now)
+		hits := make(map[int]int, len(indices))
+		for _, index := range indices {
+			if _, exists := hits[index]; !exists {
+				hits[index] = p.inlineMediaHitsLocked(p.accounts[index], selection.InlineMediaKeys, now)
+			}
+		}
+		sort.SliceStable(indices, func(left, right int) bool {
+			leftHits := hits[indices[left]]
+			rightHits := hits[indices[right]]
+			if leftHits != rightHits {
+				return leftHits > rightHits
+			}
+			if leftHits > 0 {
+				return p.accounts[indices[left]].ID < p.accounts[indices[right]].ID
+			}
+			return false
 		})
 	}
 	return indices, nil

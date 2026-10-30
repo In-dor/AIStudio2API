@@ -13,12 +13,14 @@ import (
 	"time"
 )
 
-// TestExtractInlineMediaKeysAndStickyRouting 测试内联附件提取与带内联缓存命中加权的轮询粘性调度
-func TestExtractInlineMediaKeysAndStickyRouting(t *testing.T) {
+// TestStickyRoutingForInlineMedia 测试内联附件提取、带内联缓存命中加权的调度排序及端到端粘性路由
+func TestStickyRoutingForInlineMedia(t *testing.T) {
 	img1Data := []byte("image-data-1")
 	img2Data := []byte("image-data-2")
 	h1 := sha256.Sum256(img1Data)
 	h2 := sha256.Sum256(img2Data)
+	_ = h1
+	_ = h2
 
 	contents := []Content{
 		{
@@ -50,18 +52,18 @@ func TestExtractInlineMediaKeysAndStickyRouting(t *testing.T) {
 		t.Errorf("unexpected key[1]: %+v", keys[1])
 	}
 
-	// 测试调度池粘性排序
+	// 测试调度池粘性排序与端到端获取
 	now := time.Now().UTC()
 	model := Model{ID: "gemini-2.5-flash", Methods: []string{"generateContent"}}
 	acc1 := &Account{ID: "acc-1", Config: AccountConfig{Enabled: true}, State: AccountReady, Models: []Model{model}, runtime: accountRuntimeState{Resources: make(map[string]ResourceBinding)}}
 	acc2 := &Account{ID: "acc-2", Config: AccountConfig{Enabled: true}, State: AccountReady, Models: []Model{model}, runtime: accountRuntimeState{Resources: make(map[string]ResourceBinding)}}
 	acc3 := &Account{ID: "acc-3", Config: AccountConfig{Enabled: true}, State: AccountReady, Models: []Model{model}, runtime: accountRuntimeState{Resources: make(map[string]ResourceBinding)}}
 
-	// acc2 缓存了 img1
+	// acc2 缓存了 img1 (1 命中)
 	acc2.runtime.Resources["drive-img-1"] = ResourceBinding{
 		Kind: "inline-media", MIME: keys[0].MIME, SHA256: keys[0].SHA256, DisplayName: keys[0].Name, UsedAt: now,
 	}
-	// acc3 缓存了 img1 和 img2
+	// acc3 缓存了 img1 和 img2 (2 命中)
 	acc3.runtime.Resources["drive-img-1-b"] = ResourceBinding{
 		Kind: "inline-media", MIME: keys[0].MIME, SHA256: keys[0].SHA256, DisplayName: keys[0].Name, UsedAt: now,
 	}
@@ -72,10 +74,14 @@ func TestExtractInlineMediaKeysAndStickyRouting(t *testing.T) {
 	pool := NewAccountPool([]*Account{acc1, acc2, acc3}, 1)
 	pool.SetRoutingStrategy("round-robin")
 
-	indices, err := pool.selectionIndicesLocked(AccountSelection{
+	selection := AccountSelection{
 		ModelID:         "gemini-2.5-flash",
+		Method:          "generateContent",
 		InlineMediaKeys: keys,
-	})
+	}
+
+	// 1. 验证 selectionIndicesLocked
+	indices, err := pool.selectionIndicesLocked(selection)
 	if err != nil {
 		t.Fatalf("selectionIndicesLocked failed: %v", err)
 	}
@@ -94,19 +100,111 @@ func TestExtractInlineMediaKeysAndStickyRouting(t *testing.T) {
 		t.Errorf("expected acc-1 third, got %s", pool.accounts[indices[2]].ID)
 	}
 
-	// 测试过期时间: 超过 inlineMediaIdle 的缓存不应算作命中
+	// 2. 验证 channelCandidatesLocked: 无论 lastPicked 处于何种状态，acc3 始终排在候选首位
+	pool.lastPicked["gemini-2.5-flash"] = "acc-3"
+	candidates := pool.channelCandidatesLocked(indices, selection)
+	if len(candidates) != 3 || pool.accounts[candidates[0].index].ID != "acc-3" {
+		t.Fatalf("expected channelCandidatesLocked to have acc-3 first even when lastPicked is acc-3, got %s", pool.accounts[candidates[0].index].ID)
+	}
+
+	// 3. 端到端验证 pool.AcquireFor: 连续多次真实请求必须 100% 粘在命中数最高的 acc-3 上，不发生轮询漂移
+	ctx := context.Background()
+	acquireAccount := func(sel AccountSelection) string {
+		lease, err := pool.AcquireFor(ctx, sel)
+		if err != nil {
+			t.Fatalf("AcquireFor failed for selection %+v: %v", sel, err)
+		}
+		accountID := lease.Account().ID
+		if err := lease.Release(); err != nil {
+			t.Fatalf("lease.Release failed: %v", err)
+		}
+		return accountID
+	}
+
+	for i := 0; i < 6; i++ {
+		picked := acquireAccount(selection)
+		if picked != "acc-3" {
+			t.Fatalf("request %d: expected sticky account acc-3, got %s", i, picked)
+		}
+	}
+
+	// 4. 中间穿插其它不带附件的请求改变 lastPicked，验证带附件的请求依然 100% 粘在 acc-3 上
+	normalSelection := AccountSelection{
+		ModelID: "gemini-2.5-flash",
+		Method:  "generateContent",
+	}
+	for i := 0; i < 6; i++ {
+		normalPicked := acquireAccount(normalSelection)
+		stickyPicked := acquireAccount(selection)
+		if stickyPicked != "acc-3" {
+			t.Fatalf("interspersed request %d: expected sticky acc-3, got %s (normal request picked %s)", i, stickyPicked, normalPicked)
+		}
+	}
+
+	// 5. 测试平局场景（两个账号拥有相同数量的缓存，如各命中 1 个附件）
+	delete(acc3.runtime.Resources, "drive-img-2-b")
+	// 此时 acc2 缓存了 img1 (1 命中)，acc3 缓存了 img1 (1 命中)，acc1 (0 命中)
+	// 验证 selectionIndicesLocked 在命中数平局时按确定性账号 ID 字典序排列 (acc-2 < acc-3)
+	tiedIndices, err := pool.selectionIndicesLocked(selection)
+	if err != nil {
+		t.Fatalf("selectionIndicesLocked for tied cache failed: %v", err)
+	}
+	if pool.accounts[tiedIndices[0]].ID != "acc-2" || pool.accounts[tiedIndices[1]].ID != "acc-3" {
+		t.Fatalf("expected [acc-2, acc-3] for tied cache hits, got [%s, %s]", pool.accounts[tiedIndices[0]].ID, pool.accounts[tiedIndices[1]].ID)
+	}
+
+	// 连续真实请求并在中间穿插普通请求，验证始终固定选择确定性的 acc-2，不会在 acc-2 与 acc-3 之间来回跳动
+	for i := 0; i < 6; i++ {
+		_ = acquireAccount(normalSelection)
+		tiedPicked := acquireAccount(selection)
+		if tiedPicked != "acc-2" {
+			t.Fatalf("tied request %d: expected deterministic acc-2, got %s", i, tiedPicked)
+		}
+	}
+
+	// 6. 验证未命中的新附件请求依然正常按 round-robin 轮询
+	newKeys := []InlineMediaKey{
+		{MIME: "image/png", SHA256: "new-unseen-sha256", Name: "new.png"},
+	}
+	newSelection := AccountSelection{
+		ModelID:         "gemini-2.5-flash",
+		Method:          "generateContent",
+		InlineMediaKeys: newKeys,
+	}
+	var roundRobinPicks []string
+	for i := 0; i < 6; i++ {
+		roundRobinPicks = append(roundRobinPicks, acquireAccount(newSelection))
+	}
+	for i := 0; i < len(roundRobinPicks)-1; i++ {
+		if roundRobinPicks[i] == roundRobinPicks[i+1] {
+			t.Fatalf("new keys should round-robin, but got consecutive %s at %d and %d: %v", roundRobinPicks[i], i, i+1, roundRobinPicks)
+		}
+	}
+	seen := make(map[string]bool)
+	for _, p := range roundRobinPicks {
+		seen[p] = true
+	}
+	if len(seen) != 3 {
+		t.Fatalf("expected all 3 accounts to be visited in round-robin for new keys, got %v", roundRobinPicks)
+	}
+
+	// 7. 测试过期时间: 超过 inlineMediaIdle 的缓存不应算作命中
+	acc2.runtime.Resources["drive-img-1"] = ResourceBinding{
+		Kind: "inline-media", MIME: keys[0].MIME, SHA256: keys[0].SHA256, DisplayName: keys[0].Name, UsedAt: now.Add(-2 * time.Hour),
+	}
 	acc3.runtime.Resources["drive-img-1-b"] = ResourceBinding{
 		Kind: "inline-media", MIME: keys[0].MIME, SHA256: keys[0].SHA256, DisplayName: keys[0].Name, UsedAt: now.Add(-2 * time.Hour),
 	}
-	acc3.runtime.Resources["drive-img-2-b"] = ResourceBinding{
-		Kind: "inline-media", MIME: keys[1].MIME, SHA256: keys[1].SHA256, DisplayName: keys[1].Name, UsedAt: now.Add(-2 * time.Hour),
-	}
+	hitsAcc2 := pool.inlineMediaHitsLocked(acc2, keys, now)
 	hitsAcc3 := pool.inlineMediaHitsLocked(acc3, keys, now)
-	if hitsAcc3 != 0 {
-		t.Errorf("expected 0 hits for expired items, got %d", hitsAcc3)
+	if hitsAcc2 != 0 || hitsAcc3 != 0 {
+		t.Errorf("expected 0 hits for expired items, got acc2=%d acc3=%d", hitsAcc2, hitsAcc3)
 	}
-	_ = h1
-	_ = h2
+}
+
+// TestExtractInlineMediaKeysAndStickyRouting 测试内联附件提取与带内联缓存命中加权的轮询粘性调度（兼容旧名）
+func TestExtractInlineMediaKeysAndStickyRouting(t *testing.T) {
+	TestStickyRoutingForInlineMedia(t)
 }
 
 // TestBindingPromptHashEquivalence 验证流式 SHA-256 与原始 bindingPrompt 字符串哈希的严格等价性

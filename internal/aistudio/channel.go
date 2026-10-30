@@ -246,20 +246,49 @@ func (p *AccountPool) channelCandidatesLocked(indices []int, selection AccountSe
 		}
 		return rank(candidates[left].channel) < rank(candidates[right].channel)
 	})
-	if p.routingStrategy != "round-robin" || len(indices) <= 1 && len(channels) <= 1 {
-		return candidates
-	}
-	key := selectionAccessScope(selection)
-	lastAccount := p.lastPicked[key]
-	lastChannel := p.lastPickedChannel[key]
-	start := sort.Search(len(candidates), func(position int) bool {
-		account := p.accounts[candidates[position].index].ID
-		if account != lastAccount {
-			return account > lastAccount
+	if p.routingStrategy == "round-robin" && (len(indices) > 1 || len(channels) > 1) {
+		key := selectionAccessScope(selection)
+		lastAccount := p.lastPicked[key]
+		lastChannel := p.lastPickedChannel[key]
+		start := sort.Search(len(candidates), func(position int) bool {
+			account := p.accounts[candidates[position].index].ID
+			if account != lastAccount {
+				return account > lastAccount
+			}
+			return lastChannel != "" && rank(candidates[position].channel) > rank(lastChannel)
+		})
+		if start > 0 {
+			rotated := make([]channelCandidate, 0, len(candidates))
+			rotated = append(rotated, candidates[start:]...)
+			rotated = append(rotated, candidates[:start]...)
+			candidates = rotated
 		}
-		return lastChannel != "" && rank(candidates[position].channel) > rank(lastChannel)
-	})
-	return append(candidates[start:], candidates[:start]...)
+	}
+	if len(selection.InlineMediaKeys) > 0 && len(candidates) > 1 {
+		now := time.Now().UTC()
+		hits := make(map[int]int, len(indices))
+		for _, index := range indices {
+			if _, exists := hits[index]; !exists {
+				hits[index] = p.inlineMediaHitsLocked(p.accounts[index], selection.InlineMediaKeys, now)
+			}
+		}
+		sort.SliceStable(candidates, func(left, right int) bool {
+			leftHits := hits[candidates[left].index]
+			rightHits := hits[candidates[right].index]
+			if leftHits != rightHits {
+				return leftHits > rightHits
+			}
+			if leftHits > 0 {
+				leftID, rightID := p.accounts[candidates[left].index].ID, p.accounts[candidates[right].index].ID
+				if leftID != rightID {
+					return leftID < rightID
+				}
+				return rank(candidates[left].channel) < rank(candidates[right].channel)
+			}
+			return false
+		})
+	}
+	return candidates
 }
 
 // AssistantModel 判断模型是否为经 Build 写代码助手生成的 -build 模型
