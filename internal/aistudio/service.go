@@ -450,6 +450,7 @@ func (s *PooledService) Models(ctx context.Context) ([]Model, error) {
 // RefreshAccountModels 占用指定账户的一个普通槽位刷新其权益与模型目录，不受账户启用、调度状态与冷却限制
 func (s *PooledService) RefreshAccountModels(ctx context.Context, accountID string) ([]Model, error) {
 	accountID = strings.TrimSpace(accountID)
+	s.client.InvalidateDriveCache(accountID)
 	lease, err := s.pool.AcquireFor(ctx, AccountSelection{AccountID: accountID, anyState: true})
 	if err != nil {
 		return nil, err
@@ -479,6 +480,9 @@ type AccountRefresh struct {
 // RefreshAccountState 读取账户权益与模型目录，登录失效时标记账户需要登录；wait 为 true 时等待独占租约，否则只用就绪账户的空闲槽位
 func (s *PooledService) RefreshAccountState(ctx context.Context, accountID string, wait bool) (AccountRefresh, error) {
 	accountID = strings.TrimSpace(accountID)
+	if wait {
+		s.client.InvalidateDriveCache(accountID)
+	}
 	var lease *AccountLease
 	var err error
 	if wait {

@@ -100,7 +100,7 @@ type Client struct {
 	driveCacheMu    sync.Mutex
 	driveTokens     map[string]cachedDriveToken
 	appFolders      map[string]string
-	driveNoAuth     map[string]bool
+	driveNoAuth     map[string]time.Time
 }
 
 // NewClient 创建协议客户端
@@ -115,7 +115,7 @@ func NewClient(options ClientOptions) *Client {
 		disclaimers:     make(map[string]struct{}),
 		driveTokens:     make(map[string]cachedDriveToken),
 		appFolders:      make(map[string]string),
-		driveNoAuth:     make(map[string]bool),
+		driveNoAuth:     make(map[string]time.Time),
 	}
 }
 
@@ -131,7 +131,15 @@ func (c *Client) InvalidateDriveCache(accountID string) {
 func (c *Client) isDriveAuthMissing(accountID string) bool {
 	c.driveCacheMu.Lock()
 	defer c.driveCacheMu.Unlock()
-	return c.driveNoAuth[accountID]
+	until, ok := c.driveNoAuth[accountID]
+	if !ok {
+		return false
+	}
+	if time.Now().Before(until) {
+		return true
+	}
+	delete(c.driveNoAuth, accountID)
+	return false
 }
 
 // RPCError 保存上游状态和协议错误码

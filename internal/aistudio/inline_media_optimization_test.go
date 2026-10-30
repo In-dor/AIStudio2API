@@ -300,6 +300,14 @@ func TestClientDriveCachingAndNoAuthMemoization(t *testing.T) {
 	if noAuthCalls2 != noAuthCalls1 {
 		t.Errorf("expected no additional RPC call for memoized no-auth, was %d now %d", noAuthCalls1, noAuthCalls2)
 	}
+
+	// 5. 测试 driveNoAuth TTL 过期后自动重新探测
+	client.driveCacheMu.Lock()
+	client.driveNoAuth["no-auth-user"] = time.Now().Add(-time.Second)
+	client.driveCacheMu.Unlock()
+	if client.isDriveAuthMissing("no-auth-user") {
+		t.Errorf("expected isDriveAuthMissing to be false after TTL expiry")
+	}
 }
 
 // TestCanDirectInlineMediaThreshold 测试直接内联通道的判定逻辑

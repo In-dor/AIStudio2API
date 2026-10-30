@@ -49,6 +49,9 @@ const maxConcurrentDriveUploads = 6
 // accessTokenCacheTTL 是网页版 Drive access token 缓存时长 (50 分钟)
 const accessTokenCacheTTL = 50 * time.Minute
 
+// driveNoAuthCacheTTL 是账户缺少 Google Drive 授权状态的缓存时长 (10 分钟)
+const driveNoAuthCacheTTL = 10 * time.Minute
+
 // UploadRequest 表示一次 Drive 文件上传
 type UploadRequest struct {
 	AccountID string
@@ -346,18 +349,22 @@ type DriveFileChecker interface {
 
 // GenerateAccessToken 获取网页账户授权的短期 bearer token
 func (c *Client) GenerateAccessToken(ctx context.Context, accountID string) (string, error) {
+	now := time.Now()
 	c.driveCacheMu.Lock()
-	if c.driveNoAuth[accountID] {
-		c.driveCacheMu.Unlock()
-		return "", &RPCError{
-			Method:     "GenerateAccessToken",
-			StatusCode: http.StatusUnauthorized,
-			Code:       16,
-			Message:    "OAuth error: unauthorized_client.",
+	if until, ok := c.driveNoAuth[accountID]; ok {
+		if now.Before(until) {
+			c.driveCacheMu.Unlock()
+			return "", &RPCError{
+				Method:     "GenerateAccessToken",
+				StatusCode: http.StatusUnauthorized,
+				Code:       16,
+				Message:    "OAuth error: unauthorized_client.",
+			}
 		}
+		delete(c.driveNoAuth, accountID)
 	}
 	cached, ok := c.driveTokens[accountID]
-	if ok && time.Now().Before(cached.expiresAt) && cached.token != "" {
+	if ok && now.Before(cached.expiresAt) && cached.token != "" {
 		c.driveCacheMu.Unlock()
 		return cached.token, nil
 	}
@@ -367,7 +374,7 @@ func (c *Client) GenerateAccessToken(ctx context.Context, accountID string) (str
 	if err != nil {
 		if driveAuthorizationMissing(err) {
 			c.driveCacheMu.Lock()
-			c.driveNoAuth[accountID] = true
+			c.driveNoAuth[accountID] = time.Now().Add(driveNoAuthCacheTTL)
 			c.driveCacheMu.Unlock()
 		}
 		return "", err
@@ -378,6 +385,7 @@ func (c *Client) GenerateAccessToken(ctx context.Context, accountID string) (str
 		return "", err
 	}
 	c.driveCacheMu.Lock()
+	delete(c.driveNoAuth, accountID)
 	c.driveTokens[accountID] = cachedDriveToken{
 		token:     token,
 		expiresAt: time.Now().Add(accessTokenCacheTTL),
