@@ -80,6 +80,11 @@ type ClientOptions struct {
 	ContextProvider RequestContextProvider
 }
 
+type cachedDriveToken struct {
+	token     string
+	expiresAt time.Time
+}
+
 // Client 实现 AI Studio 私有协议核心
 type Client struct {
 	transport       RPCTransport
@@ -92,6 +97,10 @@ type Client struct {
 	termsMu         sync.Mutex
 	termsAccepted   map[string]struct{}
 	disclaimers     map[string]struct{}
+	driveCacheMu    sync.Mutex
+	driveTokens     map[string]cachedDriveToken
+	appFolders      map[string]string
+	driveNoAuth     map[string]bool
 }
 
 // NewClient 创建协议客户端
@@ -104,7 +113,25 @@ func NewClient(options ClientOptions) *Client {
 		tiers:           make(map[string]BenefitTier),
 		termsAccepted:   make(map[string]struct{}),
 		disclaimers:     make(map[string]struct{}),
+		driveTokens:     make(map[string]cachedDriveToken),
+		appFolders:      make(map[string]string),
+		driveNoAuth:     make(map[string]bool),
 	}
+}
+
+// InvalidateDriveCache 清除指定账户的 Drive 缓存
+func (c *Client) InvalidateDriveCache(accountID string) {
+	c.driveCacheMu.Lock()
+	defer c.driveCacheMu.Unlock()
+	delete(c.driveTokens, accountID)
+	delete(c.appFolders, accountID)
+	delete(c.driveNoAuth, accountID)
+}
+
+func (c *Client) isDriveAuthMissing(accountID string) bool {
+	c.driveCacheMu.Lock()
+	defer c.driveCacheMu.Unlock()
+	return c.driveNoAuth[accountID]
 }
 
 // RPCError 保存上游状态和协议错误码

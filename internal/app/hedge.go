@@ -190,13 +190,24 @@ func (service *trackedService) awaitFirstEvent(
 	failed func(*generateAttempt, bool),
 ) *generateAttempt {
 	primaryDone := primary.done
+	uploadDone := primary.uploadDone
 	var hedge *generateAttempt
 	var hedgeDone <-chan struct{}
 	var check <-chan time.Time
-	if plan != nil {
-		timer := time.NewTimer(plan.delay - time.Since(primary.startedAt))
-		defer timer.Stop()
-		check = timer.C
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	startHedgeTimer := func() {
+		if plan != nil && check == nil && hedge == nil {
+			timer = time.NewTimer(plan.delay)
+			check = timer.C
+		}
+	}
+	if uploadDone == nil {
+		startHedgeTimer()
 	}
 	defer func() {
 		if hedge != nil {
@@ -205,8 +216,12 @@ func (service *trackedService) awaitFirstEvent(
 	}()
 	for primaryDone != nil || hedgeDone != nil {
 		select {
+		case <-uploadDone:
+			uploadDone = nil
+			startHedgeTimer()
 		case <-primaryDone:
 			primaryDone = nil
+			uploadDone = nil
 			check = nil
 			if primary.err == nil {
 				service.requests.firstEvents.observe(modelID, string(primary.lease.Channel()), primary.firstAt, primary.firstAt.Sub(primary.startedAt))

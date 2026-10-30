@@ -39,6 +39,16 @@ const driveResumableUploadURL = "https://www.googleapis.com/upload/drive/v3/file
 const driveUploadChunkSize = 8 << 20
 const driveCleanupTimeout = 5 * time.Second
 
+// DirectInlineMediaMaxBytes 是直接内联发送的最大附件字节数阈值 (15 MiB)
+const DirectInlineMediaMaxBytes = 15 << 20
+const directInlineMediaMaxBytes = DirectInlineMediaMaxBytes
+
+// maxConcurrentDriveUploads 是单次请求并发上传 Drive 的最大通道数
+const maxConcurrentDriveUploads = 6
+
+// accessTokenCacheTTL 是网页版 Drive access token 缓存时长 (50 分钟)
+const accessTokenCacheTTL = 50 * time.Minute
+
 // UploadRequest 表示一次 Drive 文件上传
 type UploadRequest struct {
 	AccountID string
@@ -204,6 +214,11 @@ func (copies *TemporaryFileCopies) Count() int {
 	return len(copies.copies)
 }
 
+// HasCopies 返回是否有待删除的临时文件副本
+func (copies *TemporaryFileCopies) HasCopies() bool {
+	return copies != nil && len(copies.copies) > 0
+}
+
 // SourceAccountIDs 返回临时文件的来源账户
 func (copies *TemporaryFileCopies) SourceAccountIDs() []string {
 	result := make([]string, 0, len(copies.sources))
@@ -331,22 +346,69 @@ type DriveFileChecker interface {
 
 // GenerateAccessToken 获取网页账户授权的短期 bearer token
 func (c *Client) GenerateAccessToken(ctx context.Context, accountID string) (string, error) {
+	c.driveCacheMu.Lock()
+	if c.driveNoAuth[accountID] {
+		c.driveCacheMu.Unlock()
+		return "", &RPCError{
+			Method:     "GenerateAccessToken",
+			StatusCode: http.StatusUnauthorized,
+			Code:       16,
+			Message:    "OAuth error: unauthorized_client.",
+		}
+	}
+	cached, ok := c.driveTokens[accountID]
+	if ok && time.Now().Before(cached.expiresAt) && cached.token != "" {
+		c.driveCacheMu.Unlock()
+		return cached.token, nil
+	}
+	c.driveCacheMu.Unlock()
+
 	response, err := c.do(ctx, "GenerateAccessToken", accountID, "", []byte(`["users/me"]`), false)
 	if err != nil {
+		if driveAuthorizationMissing(err) {
+			c.driveCacheMu.Lock()
+			c.driveNoAuth[accountID] = true
+			c.driveCacheMu.Unlock()
+		}
 		return "", err
 	}
 	defer response.Body.Close()
-	return parseFirstString(response.Body, "GenerateAccessToken", "bearer token")
+	token, err := parseFirstString(response.Body, "GenerateAccessToken", "bearer token")
+	if err != nil {
+		return "", err
+	}
+	c.driveCacheMu.Lock()
+	c.driveTokens[accountID] = cachedDriveToken{
+		token:     token,
+		expiresAt: time.Now().Add(accessTokenCacheTTL),
+	}
+	c.driveCacheMu.Unlock()
+	return token, nil
 }
 
 // appFolder 以官网对话附件上传前的 GetAppFolder 读取账户的应用文件夹 ID
 func (c *Client) appFolder(ctx context.Context, accountID string) (string, error) {
+	c.driveCacheMu.Lock()
+	folder, ok := c.appFolders[accountID]
+	if ok && folder != "" {
+		c.driveCacheMu.Unlock()
+		return folder, nil
+	}
+	c.driveCacheMu.Unlock()
+
 	response, err := c.do(ctx, "GetAppFolder", accountID, "", []byte("[]"), false)
 	if err != nil {
 		return "", err
 	}
 	defer response.Body.Close()
-	return parseFirstString(response.Body, "GetAppFolder", "应用文件夹 ID")
+	folder, err = parseFirstString(response.Body, "GetAppFolder", "应用文件夹 ID")
+	if err != nil {
+		return "", err
+	}
+	c.driveCacheMu.Lock()
+	c.appFolders[accountID] = folder
+	c.driveCacheMu.Unlock()
+	return folder, nil
 }
 
 // parseFirstString 读取响应数组索引 0 的非空字符串，name 为错误中的字段名
@@ -803,22 +865,57 @@ func (s *PooledService) CopyFileReferencesToLease(
 // inlineMediaIdle 是内联附件的 Drive 文件闲置后被删除的时长
 const inlineMediaIdle = time.Hour
 
-// inlineMediaKey 以 MIME、内容的 SHA-256 摘要与请求给出的文件名标识一个内联附件
-type inlineMediaKey struct {
-	mime   string
-	sha256 string
-	name   string
+// InlineMediaKey 以 MIME、内容的 SHA-256 摘要与请求给出的文件名标识一个内联附件
+type InlineMediaKey struct {
+	MIME   string
+	SHA256 string
+	Name   string
 }
+
+type inlineMediaKey = InlineMediaKey
+
+// ExtractInlineMediaKeys 提取 contents 中所有内联附件并去重返回其 InlineMediaKey
+func ExtractInlineMediaKeys(contents []Content) []InlineMediaKey {
+	var keys []InlineMediaKey
+	seen := make(map[InlineMediaKey]bool)
+	for _, content := range contents {
+		for _, part := range content.Parts {
+			if part.InlineData == nil || part.InlineData.MIME == "" || len(part.InlineData.Data) == 0 {
+				continue
+			}
+			digest := sha256.Sum256(part.InlineData.Data)
+			key := InlineMediaKey{
+				MIME:   part.InlineData.MIME,
+				SHA256: base64.StdEncoding.EncodeToString(digest[:]),
+				Name:   part.DisplayName,
+			}
+			if !seen[key] {
+				seen[key] = true
+				keys = append(keys, key)
+			}
+		}
+	}
+	return keys
+}
+
+// InlineMediaBindItem 包含待绑定或恢复的内联附件信息
+type InlineMediaBindItem struct {
+	File FileRef
+	Key  InlineMediaKey
+	Size int64
+}
+
+type inlineMediaBindItem = InlineMediaBindItem
 
 // reclaimedInlineMedia 是解除绑定待删除的闲置内联附件
 type reclaimedInlineMedia struct {
 	file FileRef
-	key  inlineMediaKey
+	key  InlineMediaKey
 	size int64
 }
 
 // claimInlineMedia 在当前账户已上传的内联附件中查找 keys 并刷新命中项的使用时间，解除闲置超过 inlineMediaIdle 的附件绑定，返回命中的文件与解除绑定的附件
-func (l *AccountLease) claimInlineMedia(ctx context.Context, keys []inlineMediaKey, busy func(string) bool) (map[inlineMediaKey]FileRef, []reclaimedInlineMedia, error) {
+func (l *AccountLease) claimInlineMedia(ctx context.Context, keys []InlineMediaKey, busy func(string) bool) (map[InlineMediaKey]FileRef, []reclaimedInlineMedia, error) {
 	l.operation.Lock()
 	defer l.operation.Unlock()
 	if l.released {
@@ -826,20 +923,20 @@ func (l *AccountLease) claimInlineMedia(ctx context.Context, keys []inlineMediaK
 	}
 	l.account.storageMu.Lock()
 	defer l.account.storageMu.Unlock()
-	wanted := make(map[inlineMediaKey]bool, len(keys))
+	wanted := make(map[InlineMediaKey]bool, len(keys))
 	for _, key := range keys {
 		wanted[key] = true
 	}
-	var found map[inlineMediaKey]FileRef
+	var found map[InlineMediaKey]FileRef
 	var expired []reclaimedInlineMedia
 	_, err := l.pool.updateRuntimeContext(ctx, l.account.ID, func(_ *Account, runtimeState *accountRuntimeState) (bool, func(*Account), error) {
-		found, expired = make(map[inlineMediaKey]FileRef, len(keys)), nil
+		found, expired = make(map[InlineMediaKey]FileRef, len(keys)), nil
 		now := time.Now().UTC()
 		for id, binding := range runtimeState.Resources {
 			if binding.Kind != "inline-media" {
 				continue
 			}
-			key := inlineMediaKey{mime: binding.MIME, sha256: binding.SHA256, name: binding.DisplayName}
+			key := InlineMediaKey{MIME: binding.MIME, SHA256: binding.SHA256, Name: binding.DisplayName}
 			if _, claimed := found[key]; wanted[key] && !claimed {
 				found[key] = FileRef{ID: id, Name: binding.Name, MIME: binding.MIME}
 				binding.UsedAt = now
@@ -857,27 +954,19 @@ func (l *AccountLease) claimInlineMedia(ctx context.Context, keys []inlineMediaK
 	return found, expired, nil
 }
 
-// bindInlineMedia 记录上传到当前账户的内联附件
-func (l *AccountLease) bindInlineMedia(ctx context.Context, file FileRef, key inlineMediaKey, size int64) error {
+// bindInlineMediaBatch 批量记录上传到当前账户的内联附件
+func (l *AccountLease) bindInlineMediaBatch(ctx context.Context, items []InlineMediaBindItem) error {
 	l.operation.Lock()
 	defer l.operation.Unlock()
 	if l.released {
 		return fmt.Errorf("账户租约已释放")
 	}
-	l.account.storageMu.Lock()
-	defer l.account.storageMu.Unlock()
-	accountID := l.account.ID
-	_, err := l.pool.updateRuntimeContext(ctx, accountID, func(_ *Account, runtimeState *accountRuntimeState) (bool, func(*Account), error) {
-		if owner, exists := l.pool.resources[file.ID]; exists && owner != accountID {
-			return false, nil, fmt.Errorf("资源 %s 已绑定账户 %s", file.ID, owner)
-		}
-		now := time.Now().UTC()
-		runtimeState.Resources[file.ID] = ResourceBinding{
-			Kind: "inline-media", Name: file.Name, MIME: file.MIME, Size: size, SHA256: key.sha256, CreatedAt: now, UsedAt: now, DisplayName: key.name,
-		}
-		return true, nil, nil
-	})
-	return err
+	return l.pool.BindInlineMediaForAccount(ctx, l.account.ID, items)
+}
+
+// bindInlineMedia 记录上传到当前账户的单条内联附件
+func (l *AccountLease) bindInlineMedia(ctx context.Context, file FileRef, key InlineMediaKey, size int64) error {
+	return l.bindInlineMediaBatch(ctx, []InlineMediaBindItem{{File: file, Key: key, Size: size}})
 }
 
 // useInlineMedia 记录进行中的请求引用了 ids，返回释放这些引用的函数
@@ -908,6 +997,156 @@ func (s *PooledService) inlineMediaBusy(id string) bool {
 	return s.inlineMediaUses[id] > 0
 }
 
+type uploadJob struct {
+	key  InlineMediaKey
+	name string
+	blob *Blob
+}
+
+func canDirectInlineMedia(jobs []uploadJob) bool {
+	if len(jobs) == 0 {
+		return false
+	}
+	var totalBytes int64
+	for _, job := range jobs {
+		if job.blob == nil {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(job.blob.MIME), "video/") {
+			return false
+		}
+		totalBytes += int64(len(job.blob.Data))
+	}
+	return totalBytes <= directInlineMediaMaxBytes
+}
+
+func prewarmKey(accountID string, key InlineMediaKey) string {
+	return accountID + "|" + key.MIME + "|" + key.SHA256 + "|" + key.Name
+}
+
+func (s *PooledService) deleteExpiredInlineMediaAsync(target *AccountLease, expired []reclaimedInlineMedia) {
+	if len(expired) == 0 {
+		return
+	}
+	targetID := target.Account().ID
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	ctx = ContextWithAccountLease(ctx, target)
+
+	token, err := s.client.GenerateAccessToken(ctx, targetID)
+	if err != nil {
+		var restoreItems []InlineMediaBindItem
+		for _, media := range expired {
+			restoreItems = append(restoreItems, InlineMediaBindItem{File: media.file, Key: media.key, Size: media.size})
+		}
+		_ = s.pool.BindInlineMediaForAccount(ctx, targetID, restoreItems)
+		return
+	}
+
+	for _, media := range expired {
+		cleanupCtx, cleanupCancel := context.WithTimeout(ctx, driveCleanupTimeout)
+		deleteErr := s.client.deleteDriveFile(cleanupCtx, targetID, token, media.file.ID)
+		cleanupCancel()
+		if deleteErr != nil && !driveFileNotFound(deleteErr, "DriveDelete") {
+			_ = s.pool.BindInlineMediaForAccount(ctx, targetID, []InlineMediaBindItem{
+				{File: media.file, Key: media.key, Size: media.size},
+			})
+		}
+	}
+}
+
+func (s *PooledService) prewarmInlineMediaAsync(target *AccountLease, jobs []uploadJob) {
+	if len(jobs) == 0 {
+		return
+	}
+	targetID := target.Account().ID
+	s.prewarmingMu.Lock()
+	if s.prewarming == nil {
+		s.prewarming = make(map[string]struct{})
+	}
+	var toUpload []uploadJob
+	for _, job := range jobs {
+		pk := prewarmKey(targetID, job.key)
+		if _, inFlight := s.prewarming[pk]; !inFlight {
+			s.prewarming[pk] = struct{}{}
+			toUpload = append(toUpload, job)
+		}
+	}
+	s.prewarmingMu.Unlock()
+
+	if len(toUpload) == 0 {
+		return
+	}
+	defer func() {
+		s.prewarmingMu.Lock()
+		for _, job := range toUpload {
+			delete(s.prewarming, prewarmKey(targetID, job.key))
+		}
+		s.prewarmingMu.Unlock()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	ctx = ContextWithAccountLease(ctx, target)
+
+	token, err := s.client.GenerateAccessToken(ctx, targetID)
+	if err != nil {
+		return
+	}
+	folder, err := s.client.appFolder(ctx, targetID)
+	if err != nil {
+		return
+	}
+	drive, ok := s.client.transport.(DriveTransport)
+	if !ok {
+		return
+	}
+
+	sem := make(chan struct{}, maxConcurrentDriveUploads)
+	type uploadedItem struct {
+		job  uploadJob
+		file FileRef
+		err  error
+	}
+	results := make(chan uploadedItem, len(toUpload))
+	for _, job := range toUpload {
+		go func(j uploadJob) {
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				results <- uploadedItem{job: j, err: ctx.Err()}
+				return
+			}
+			file, uerr := drive.UploadDrive(ctx, targetID, token, UploadRequest{
+				AccountID: targetID,
+				Name:      j.name,
+				MIME:      j.blob.MIME,
+				Size:      int64(len(j.blob.Data)),
+				Reader:    bytes.NewReader(j.blob.Data),
+				Folder:    folder,
+			})
+			results <- uploadedItem{job: j, file: file, err: uerr}
+		}(job)
+	}
+
+	var bindings []InlineMediaBindItem
+	for range toUpload {
+		res := <-results
+		if res.err == nil {
+			bindings = append(bindings, InlineMediaBindItem{
+				File: res.file,
+				Key:  res.job.key,
+				Size: int64(len(res.job.blob.Data)),
+			})
+		}
+	}
+
+	if len(bindings) > 0 {
+		_ = s.pool.BindInlineMediaForAccount(ctx, targetID, bindings)
+	}
+}
+
 // UploadInlineMediaToLease 把内联附件改写为目标账户 Drive 文件的引用，同一账户已上传过的相同内容直接引用，闲置超过 inlineMediaIdle 的旧文件在本次请求结束时删除
 func (s *PooledService) UploadInlineMediaToLease(
 	ctx context.Context,
@@ -931,17 +1170,12 @@ func (s *PooledService) UploadInlineMediaToLease(
 		content int
 		part    int
 	}
-	type uploadJob struct {
-		key  inlineMediaKey
-		name string
-		blob *Blob
-	}
 	type uploadResult struct {
 		index int
 		file  FileRef
 		err   error
 	}
-	parts := make(map[inlineMediaKey][]partIndex)
+	parts := make(map[InlineMediaKey][]partIndex)
 	jobs := make([]uploadJob, 0)
 	mediaIndex := 0
 	for contentIndex := range rewritten {
@@ -955,14 +1189,17 @@ func (s *PooledService) UploadInlineMediaToLease(
 			}
 			mediaIndex++
 			digest := sha256.Sum256(part.InlineData.Data)
-			key := inlineMediaKey{mime: part.InlineData.MIME, sha256: base64.StdEncoding.EncodeToString(digest[:]), name: part.DisplayName}
+			key := InlineMediaKey{MIME: part.InlineData.MIME, SHA256: base64.StdEncoding.EncodeToString(digest[:]), Name: part.DisplayName}
 			if _, seen := parts[key]; !seen {
-				jobs = append(jobs, uploadJob{key: key, name: cmp.Or(key.name, fmt.Sprintf("inline-media-%d", mediaIndex)), blob: part.InlineData})
+				jobs = append(jobs, uploadJob{key: key, name: cmp.Or(key.Name, fmt.Sprintf("inline-media-%d", mediaIndex)), blob: part.InlineData})
 			}
 			parts[key] = append(parts[key], partIndex{content: contentIndex, part: index})
 		}
 	}
-	keys := make([]inlineMediaKey, len(jobs))
+	if len(jobs) == 0 {
+		return rewritten, temporary, nil
+	}
+	keys := make([]InlineMediaKey, len(jobs))
 	for index, job := range jobs {
 		keys[index] = job.key
 	}
@@ -979,72 +1216,144 @@ func (s *PooledService) UploadInlineMediaToLease(
 		_, claimed := files[job.key]
 		return claimed
 	})
-	var token string
-	if len(pending) > 0 || len(expired) > 0 {
-		token, err = s.client.GenerateAccessToken(targetCtx, targetID)
-		if err != nil {
-			for _, media := range expired {
-				err = errors.Join(err, target.bindInlineMedia(context.WithoutCancel(targetCtx), media.file, media.key, media.size))
-			}
-			temporary.release = s.useInlineMedia(used)
-			if driveAuthorizationMissing(err) {
-				return rewritten, temporary, nil
-			}
-			if DefinitiveAuthenticationFailure(err) {
-				err = errors.Join(err, target.ConfirmAuthenticationFailure(targetCtx, err))
-			}
-			return nil, nil, errors.Join(err, temporary.Cleanup())
+
+	// Case 1: All files already cached in Drive
+	if len(pending) == 0 {
+		temporary.release = s.useInlineMedia(used)
+		if len(expired) > 0 && !s.client.isDriveAuthMissing(targetID) {
+			go s.deleteExpiredInlineMediaAsync(target, expired)
 		}
+		for key, indexes := range parts {
+			if file, claimed := files[key]; claimed {
+				for _, index := range indexes {
+					part := &rewritten[index.content].Parts[index.part]
+					part.InlineData = nil
+					part.File = &file
+				}
+			}
+		}
+		return rewritten, temporary, nil
+	}
+
+	// Case 2: Fast Direct Inline Path (uncached media <= 15 MiB and no video, or account lacks Drive auth)
+	if canDirectInlineMedia(pending) || s.client.isDriveAuthMissing(targetID) {
+		temporary.release = s.useInlineMedia(used)
+		if len(expired) > 0 && !s.client.isDriveAuthMissing(targetID) {
+			go s.deleteExpiredInlineMediaAsync(target, expired)
+		}
+		// Rewrite only claimed parts to wire[5], leave pending parts as wire[2] (InlineData intact)
+		for key, indexes := range parts {
+			if file, claimed := files[key]; claimed {
+				for _, index := range indexes {
+					part := &rewritten[index.content].Parts[index.part]
+					part.InlineData = nil
+					part.File = &file
+				}
+			}
+		}
+		// Background pre-warming (Dual Engine)
+		if len(pending) > 0 && !s.client.isDriveAuthMissing(targetID) {
+			go s.prewarmInlineMediaAsync(target, pending)
+		}
+		return rewritten, temporary, nil
+	}
+
+	// Case 3: Synchronous Drive Upload Path (uncached media > 15 MiB or contains video)
+	token, err := s.client.GenerateAccessToken(targetCtx, targetID)
+	if err != nil {
+		var restoreItems []InlineMediaBindItem
+		for _, media := range expired {
+			restoreItems = append(restoreItems, InlineMediaBindItem{File: media.file, Key: media.key, Size: media.size})
+		}
+		if len(restoreItems) > 0 {
+			err = errors.Join(err, target.bindInlineMediaBatch(context.WithoutCancel(targetCtx), restoreItems))
+		}
+		temporary.release = s.useInlineMedia(used)
+		if driveAuthorizationMissing(err) {
+			return rewritten, temporary, nil
+		}
+		if DefinitiveAuthenticationFailure(err) {
+			err = errors.Join(err, target.ConfirmAuthenticationFailure(targetCtx, err))
+		}
+		return nil, nil, errors.Join(err, temporary.Cleanup())
 	}
 	for _, media := range expired {
 		temporary.copies = append(temporary.copies, temporaryDriveCopy{id: media.file.ID, token: token, media: &media})
 	}
-	var uploadErr error
-	if len(pending) > 0 {
-		drive := s.client.transport.(DriveTransport)
-		uploadCtx, cancelUploads := context.WithCancel(targetCtx)
-		resultChannel := make(chan uploadResult, len(pending))
-		for index, job := range pending {
-			go func(index int, job uploadJob) {
-				folder, err := s.client.appFolder(uploadCtx, targetID)
-				var file FileRef
-				if err == nil {
-					file, err = drive.UploadDrive(uploadCtx, targetID, token, UploadRequest{
-						AccountID: targetID,
-						Name:      job.name,
-						MIME:      job.blob.MIME,
-						Size:      int64(len(job.blob.Data)),
-						Reader:    bytes.NewReader(job.blob.Data),
-						Folder:    folder,
-					})
-				}
-				resultChannel <- uploadResult{index: index, file: file, err: err}
-			}(index, job)
-		}
-		results := make([]uploadResult, len(pending))
-		for range pending {
-			result := <-resultChannel
-			results[result.index] = result
-			if result.err != nil {
-				cancelUploads()
-			}
-		}
+
+	drive, ok := s.client.transport.(DriveTransport)
+	if !ok {
+		return nil, nil, errors.Join(fmt.Errorf("transport does not support Drive"), temporary.Cleanup())
+	}
+	uploadCtx, cancelUploads := context.WithCancel(targetCtx)
+	folder, err := s.client.appFolder(uploadCtx, targetID)
+	if err != nil {
 		cancelUploads()
-		for index, result := range results {
-			if result.err != nil {
-				uploadErr = errors.Join(uploadErr, result.err)
-				continue
+		return nil, nil, errors.Join(err, temporary.Cleanup())
+	}
+
+	sem := make(chan struct{}, maxConcurrentDriveUploads)
+	resultChannel := make(chan uploadResult, len(pending))
+	for index, job := range pending {
+		go func(index int, job uploadJob) {
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-uploadCtx.Done():
+				resultChannel <- uploadResult{index: index, err: uploadCtx.Err()}
+				return
 			}
-			job := pending[index]
-			if bindErr := target.bindInlineMedia(targetCtx, result.file, job.key, int64(len(job.blob.Data))); bindErr != nil {
-				temporary.copies = append(temporary.copies, temporaryDriveCopy{id: result.file.ID, token: token})
-				uploadErr = errors.Join(uploadErr, bindErr)
-				continue
-			}
-			files[job.key] = result.file
-			used = append(used, result.file.ID)
+			file, err := drive.UploadDrive(uploadCtx, targetID, token, UploadRequest{
+				AccountID: targetID,
+				Name:      job.name,
+				MIME:      job.blob.MIME,
+				Size:      int64(len(job.blob.Data)),
+				Reader:    bytes.NewReader(job.blob.Data),
+				Folder:    folder,
+			})
+			resultChannel <- uploadResult{index: index, file: file, err: err}
+		}(index, job)
+	}
+
+	results := make([]uploadResult, len(pending))
+	var uploadErr error
+	for range pending {
+		result := <-resultChannel
+		results[result.index] = result
+		if result.err != nil {
+			cancelUploads()
 		}
 	}
+	cancelUploads()
+
+	var bindItems []InlineMediaBindItem
+	for index, result := range results {
+		if result.err != nil {
+			uploadErr = errors.Join(uploadErr, result.err)
+			continue
+		}
+		job := pending[index]
+		bindItems = append(bindItems, InlineMediaBindItem{
+			File: result.file,
+			Key:  job.key,
+			Size: int64(len(job.blob.Data)),
+		})
+	}
+
+	if len(bindItems) > 0 {
+		if bindErr := target.bindInlineMediaBatch(targetCtx, bindItems); bindErr != nil {
+			for _, item := range bindItems {
+				temporary.copies = append(temporary.copies, temporaryDriveCopy{id: item.File.ID, token: token})
+			}
+			uploadErr = errors.Join(uploadErr, bindErr)
+		} else {
+			for _, item := range bindItems {
+				files[item.Key] = item.File
+				used = append(used, item.File.ID)
+			}
+		}
+	}
+
 	temporary.release = s.useInlineMedia(used)
 	if uploadErr != nil {
 		if DefinitiveAuthenticationFailure(uploadErr) {
@@ -1052,6 +1361,7 @@ func (s *PooledService) UploadInlineMediaToLease(
 		}
 		return nil, nil, errors.Join(uploadErr, temporary.Cleanup())
 	}
+
 	for key, indexes := range parts {
 		for _, index := range indexes {
 			file := files[key]
@@ -1060,14 +1370,13 @@ func (s *PooledService) UploadInlineMediaToLease(
 			part.File = &file
 		}
 	}
-	if len(pending) > 0 {
-		stateErr := errors.Join(
-			target.MarkAuthenticationValid(),
-			s.pool.ClearCooldownIfGeneration(targetID, "", target.ModelAccessGeneration(), target.CheckedAt()),
-		)
-		if stateErr != nil {
-			return nil, nil, errors.Join(stateErr, temporary.Cleanup())
-		}
+
+	stateErr := errors.Join(
+		target.MarkAuthenticationValid(),
+		s.pool.ClearCooldownIfGeneration(targetID, "", target.ModelAccessGeneration(), target.CheckedAt()),
+	)
+	if stateErr != nil {
+		return nil, nil, errors.Join(stateErr, temporary.Cleanup())
 	}
 	return rewritten, temporary, nil
 }

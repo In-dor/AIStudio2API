@@ -252,6 +252,7 @@ type AccountSelection struct {
 	PlaygroundOnly    bool
 	Channel           Channel
 	PreferredChannel  Channel
+	InlineMediaKeys   []InlineMediaKey
 	anyTier           bool
 	anyState          bool
 }
@@ -2613,7 +2614,85 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 		start := sort.Search(len(indices), func(index int) bool { return p.accounts[indices[index]].ID > last })
 		indices = append(indices[start:], indices[:start]...)
 	}
+	if len(selection.InlineMediaKeys) > 0 && len(indices) > 1 {
+		now := time.Now().UTC()
+		sort.SliceStable(indices, func(i, j int) bool {
+			return p.inlineMediaHitsLocked(p.accounts[indices[i]], selection.InlineMediaKeys, now) >
+				p.inlineMediaHitsLocked(p.accounts[indices[j]], selection.InlineMediaKeys, now)
+		})
+	}
 	return indices, nil
+}
+
+// inlineMediaHitsLocked 计算账户中已缓存且未过期的内联附件命中数量
+func (p *AccountPool) inlineMediaHitsLocked(account *Account, keys []InlineMediaKey, now time.Time) int {
+	if account == nil || len(account.runtime.Resources) == 0 || len(keys) == 0 {
+		return 0
+	}
+	cached := make(map[InlineMediaKey]struct{})
+	for _, binding := range account.runtime.Resources {
+		if binding.Kind != "inline-media" {
+			continue
+		}
+		if now.Sub(binding.UsedAt) >= inlineMediaIdle {
+			continue
+		}
+		cached[InlineMediaKey{
+			MIME:   binding.MIME,
+			SHA256: binding.SHA256,
+			Name:   binding.DisplayName,
+		}] = struct{}{}
+	}
+	hits := 0
+	seen := make(map[InlineMediaKey]struct{}, len(keys))
+	for _, key := range keys {
+		if _, already := seen[key]; already {
+			continue
+		}
+		seen[key] = struct{}{}
+		if _, exists := cached[key]; exists {
+			hits++
+		}
+	}
+	return hits
+}
+
+// BindInlineMediaForAccount 批量写入账户的内联附件绑定，单次加锁并持久化
+func (p *AccountPool) BindInlineMediaForAccount(ctx context.Context, accountID string, items []InlineMediaBindItem) error {
+	if len(items) == 0 {
+		return nil
+	}
+	p.mu.Lock()
+	account := p.byID[accountID]
+	p.mu.Unlock()
+	if account == nil {
+		return fmt.Errorf("账户不存在: %s", accountID)
+	}
+	account.storageMu.Lock()
+	defer account.storageMu.Unlock()
+	_, err := p.updateRuntimeContext(ctx, accountID, func(_ *Account, runtimeState *accountRuntimeState) (bool, func(*Account), error) {
+		if runtimeState.Resources == nil {
+			runtimeState.Resources = make(map[string]ResourceBinding)
+		}
+		now := time.Now().UTC()
+		for _, item := range items {
+			if owner, exists := p.resources[item.File.ID]; exists && owner != accountID {
+				return false, nil, fmt.Errorf("资源 %s 已绑定账户 %s", item.File.ID, owner)
+			}
+			runtimeState.Resources[item.File.ID] = ResourceBinding{
+				Kind:        "inline-media",
+				Name:        item.File.Name,
+				MIME:        item.File.MIME,
+				Size:        item.Size,
+				SHA256:      item.Key.SHA256,
+				CreatedAt:   now,
+				UsedAt:      now,
+				DisplayName: item.Key.Name,
+			}
+		}
+		return true, nil, nil
+	})
+	return err
 }
 
 // SetRoutingStrategy 设置账户轮询或优先填满策略

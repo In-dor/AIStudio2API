@@ -3,6 +3,7 @@ package aistudio
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -40,6 +41,10 @@ type PooledService struct {
 	inlineMediaMu sync.Mutex
 	// inlineMediaUses 是本进程进行中的请求引用的内联附件文件 ID 与引用数
 	inlineMediaUses map[string]int
+	// prewarmingMu 保护 prewarming
+	prewarmingMu sync.Mutex
+	// prewarming 记录正在后台上传预热的附件键
+	prewarming map[string]struct{}
 }
 
 // PoolRequestContextProvider 从租约账户读取协议上下文
@@ -95,7 +100,11 @@ func NewPooledService(pool *AccountPool, client *Client) *PooledService {
 	for accountID, catalog := range pool.takeCachedCatalogs() {
 		client.setModelCatalog(accountID, catalog)
 	}
-	return &PooledService{pool: pool, client: client}
+	return &PooledService{
+		pool:        pool,
+		client:      client,
+		prewarming:  make(map[string]struct{}),
+	}
 }
 
 // NewPoolRequestContextProvider 创建账户协议上下文提供者
@@ -113,6 +122,7 @@ func NewWorkerProtectedTransport(options WorkerProtectedTransportOptions) *Worke
 // DoProtected 写入 fresh proof 后经账户的 WAA 运行时发送 GenerateContent、Build 代理或写代码助手请求，写入页面输入框的提示词为最后一个轮次的文本
 func (t *WorkerProtectedTransport) DoProtected(ctx context.Context, request GenerateRequest, rpc RPCRequest) (*RPCResponse, error) {
 	var prompt string
+	var promptHash string
 	var err error
 	proofField := 5
 	switch rpc.Method {
@@ -120,17 +130,17 @@ func (t *WorkerProtectedTransport) DoProtected(ctx context.Context, request Gene
 		prompt, err = buildBindingPrompt(rpc.Body)
 		proofField = buildProofField
 	case assistantOfflineMethod:
-		prompt, err = bindingPrompt(request)
+		promptHash, err = bindingPromptHash(request)
 		proofField = assistantProofField
 	default:
-		prompt, err = bindingPrompt(request)
+		promptHash, err = bindingPromptHash(request)
 	}
 	if err != nil {
 		return nil, err
 	}
 	page := contentsText(request.Contents[max(len(request.Contents)-1, 0):])
 	modelID := strings.TrimPrefix(strings.TrimSpace(request.Model), "models/")
-	return t.doPrepared(ctx, prompt, page, proofField, AccountSelection{
+	return t.doPreparedWithHash(ctx, prompt, promptHash, page, proofField, AccountSelection{
 		ModelID: modelID, Method: "generateContent", AccountID: strings.TrimSpace(request.AccountID),
 	}, rpc)
 }
@@ -144,7 +154,19 @@ func (t *WorkerProtectedTransport) doPrepared(
 	selection AccountSelection,
 	rpc RPCRequest,
 ) (*RPCResponse, error) {
-	lease, worker, rpc, err := t.prepareProtectedRequest(ctx, prompt, page, proofField, selection, rpc)
+	return t.doPreparedWithHash(ctx, prompt, "", page, proofField, selection, rpc)
+}
+
+func (t *WorkerProtectedTransport) doPreparedWithHash(
+	ctx context.Context,
+	prompt string,
+	promptHash string,
+	page string,
+	proofField int,
+	selection AccountSelection,
+	rpc RPCRequest,
+) (*RPCResponse, error) {
+	lease, worker, rpc, err := t.prepareProtectedRequestWithHash(ctx, prompt, promptHash, page, proofField, selection, rpc)
 	if err != nil {
 		return nil, err
 	}
@@ -207,6 +229,18 @@ func (t *WorkerProtectedTransport) prepareProtectedRequest(
 	selection AccountSelection,
 	rpc RPCRequest,
 ) (*AccountLease, ProtectedPreparer, RPCRequest, error) {
+	return t.prepareProtectedRequestWithHash(ctx, prompt, "", page, proofField, selection, rpc)
+}
+
+func (t *WorkerProtectedTransport) prepareProtectedRequestWithHash(
+	ctx context.Context,
+	prompt string,
+	promptHash string,
+	page string,
+	proofField int,
+	selection AccountSelection,
+	rpc RPCRequest,
+) (*AccountLease, ProtectedPreparer, RPCRequest, error) {
 	lease, ok := AccountLeaseFromContext(ctx)
 	if !ok {
 		return nil, nil, RPCRequest{}, fmt.Errorf("受保护请求缺少账户租约")
@@ -221,7 +255,7 @@ func (t *WorkerProtectedTransport) prepareProtectedRequest(
 	reportRequestPhase(ctx, RequestPhasePreparingWAA)
 	prepared, err := worker.Prepare(ctx, ProtectedRequest{
 		URL: rpc.URL, Headers: rpc.Header.Clone(), Body: rpc.Body,
-		Prompt: prompt, PagePrompt: page, ProofField: proofField,
+		Prompt: prompt, PromptHash: promptHash, PagePrompt: page, ProofField: proofField,
 	})
 	if err != nil {
 		return nil, nil, RPCRequest{}, fmt.Errorf("准备 fresh WAA proof: %w", err)
@@ -301,6 +335,34 @@ func bindingPrompt(request GenerateRequest) (string, error) {
 		}
 	}
 	return b.String(), nil
+}
+
+func bindingPromptHash(request GenerateRequest) (string, error) {
+	if len(request.Contents) == 0 {
+		return "", fmt.Errorf("GenerateContent contents 不能为空")
+	}
+	hasher := sha256.New()
+	first := true
+	for _, content := range request.Contents {
+		for _, part := range content.Parts {
+			if !first {
+				hasher.Write([]byte{' '})
+			}
+			first = false
+			switch {
+			case part.Text != "":
+				_, _ = io.WriteString(hasher, part.Text)
+			case part.InlineData != nil:
+				enc := base64.NewEncoder(base64.StdEncoding, hasher)
+				_, _ = enc.Write(part.InlineData.Data)
+				_ = enc.Close()
+			case part.File != nil:
+				_, _ = io.WriteString(hasher, part.File.ID)
+			default:
+			}
+		}
+	}
+	return fmt.Sprintf("%x", hasher.Sum(nil)), nil
 }
 
 // contentsText 返回各 Part 的文本以空格连接，作为写入页面输入框的提示词

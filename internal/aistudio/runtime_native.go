@@ -52,7 +52,7 @@ func (worker *NativeWorker) Prepare(ctx context.Context, request ProtectedReques
 	if err != nil {
 		return PreparedProtectedRequest{}, fmt.Errorf("受保护请求缺少 WAA field %d: %w", request.ProofField, err)
 	}
-	proof, headers, err := worker.proofAndHeaders(ctx, request.Prompt, request.PagePrompt)
+	proof, headers, err := worker.proofAndHeaders(ctx, request.Prompt, request.PromptHash, request.PagePrompt)
 	if err != nil {
 		return PreparedProtectedRequest{}, err
 	}
@@ -62,15 +62,18 @@ func (worker *NativeWorker) Prepare(ctx context.Context, request ProtectedReques
 	return PreparedProtectedRequest{Body: body, Headers: headers}, nil
 }
 
-// proofAndHeaders 把 page 写入页面提示词后为 binding 的 SHA-256 生成 fresh proof，再取公共协议头
-func (worker *NativeWorker) proofAndHeaders(ctx context.Context, binding, page string) (string, http.Header, error) {
+// proofAndHeaders 把 page 写入页面提示词后为 binding 或其 SHA-256 生成 fresh proof，再取公共协议头
+func (worker *NativeWorker) proofAndHeaders(ctx context.Context, binding, bindingHash, page string) (string, http.Header, error) {
 	worker.operationMu.Lock()
 	defer worker.operationMu.Unlock()
 	worker.setPhase(WorkerBusy)
-	hasher := sha256.New()
-	_, _ = io.WriteString(hasher, binding)
-	digest := hasher.Sum(nil)
-	proof, err := worker.runtime.Proof(ctx, fmt.Sprintf("%x", digest), page)
+	hexHash := bindingHash
+	if hexHash == "" {
+		hasher := sha256.New()
+		_, _ = io.WriteString(hasher, binding)
+		hexHash = fmt.Sprintf("%x", hasher.Sum(nil))
+	}
+	proof, err := worker.runtime.Proof(ctx, hexHash, page)
 	var headers http.Header
 	if err == nil {
 		headers, err = worker.runtime.ProtocolHeaders(ctx)

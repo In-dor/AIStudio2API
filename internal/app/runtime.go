@@ -1667,6 +1667,7 @@ type generateAttempt struct {
 	err              error
 	cancel           context.CancelFunc
 	done             chan struct{}
+	uploadDone       chan struct{}
 }
 
 // generateRetry 是生成请求跨尝试的换号与恢复状态
@@ -1722,6 +1723,7 @@ func (service *trackedService) generateWithRetry(
 	var activity *upstreamActivity
 	var err error
 	_, totalMediaBytes := inlineMediaInput(request.Contents)
+	inlineKeys := aistudio.ExtractInlineMediaKeys(request.Contents)
 	copyFiles := false
 	for attempt := 0; attempt < retry.maxAttempts; attempt++ {
 		selectionAccountID := requestedAccountID
@@ -1737,6 +1739,7 @@ func (service *trackedService) generateWithRetry(
 		selection := aistudio.AccountSelection{
 			ModelID: modelID, Method: "generateContent",
 			AccountID: selectionAccountID, ResourceID: selectionResourceID,
+			InlineMediaKeys: inlineKeys,
 		}
 		if resourceID != "" || request.Config.SpeechConfig != nil && request.Config.SpeechConfig.Mode != "" {
 			selection.PlaygroundOnly = true
@@ -1828,7 +1831,7 @@ func (service *trackedService) generateWithRetry(
 		var plan *hedgePlan
 		if hedgeable && !hedged {
 			if delay, ok := service.hedgeDelay(modelID, string(lease.Channel())); ok {
-				fixed := resourceID != "" || requestedAccountID != ""
+				fixed := resourceID != "" || requestedAccountID != "" || totalMediaBytes > aistudio.DirectInlineMediaMaxBytes
 				plan = &hedgePlan{delay: delay, selections: service.hedgeSelections(selection, lease.Account().ID, fixed, retry.attempted)}
 				plan.start = func(hedgeLease *aistudio.AccountLease, hedgeSelection aistudio.AccountSelection) *generateAttempt {
 					hedged = true
@@ -1964,6 +1967,7 @@ func (service *trackedService) startAttempt(
 		lease: lease, selection: selection, hedge: hedge, accountLabel: lease.Account().Config.Label,
 		proxy: service.proxies.Binding(request.AccountID), workerGeneration: service.workers.WorkerGeneration(request.AccountID),
 		startedAt: time.Now(), activity: &upstreamActivity{}, done: make(chan struct{}),
+		uploadDone: make(chan struct{}),
 	}
 	attemptCtx, cancel := context.WithCancel(requestCtx)
 	attempt.cancel = cancel
@@ -1983,6 +1987,16 @@ func (service *trackedService) runAttempt(
 	fallbackReason string,
 	attempt *generateAttempt,
 ) {
+	var uploadDoneOnce sync.Once
+	closeUploadDone := func() {
+		uploadDoneOnce.Do(func() {
+			if attempt.uploadDone != nil {
+				close(attempt.uploadDone)
+			}
+		})
+	}
+	defer closeUploadDone()
+
 	lease, accountLabel := attempt.lease, attempt.accountLabel
 	originalContents := request.Contents
 	ctx = aistudio.ContextWithAccountLease(ctx, lease)
@@ -2021,6 +2035,7 @@ func (service *trackedService) runAttempt(
 			))
 		}
 	}
+	closeUploadDone()
 	prepareStartedAt := time.Now()
 	prepareTiming := newRequestPreparationTiming(prepareStartedAt)
 	prepareWait := startWaitReporter(func(waited time.Duration) {
@@ -2450,26 +2465,30 @@ func (service *trackedService) forwardEvents(
 	defer func() {
 		api.SetAccessLogUpstreamBytes(requestCtx, activity.bytes.Load())
 		api.SetAccessLogGenerationResult(requestCtx, usage, toolCalls)
-		if temporaryCopies != nil {
-			if err := temporaryCopies.Cleanup(); err != nil {
-				service.requests.log(accountLabel, "WARN", "临时文件清理失败 | 错误="+err.Error())
-			}
-		}
-		if err := lease.Release(); err != nil {
-			state = "failed"
-			requestErr = errors.Join(requestErr, err)
-			if clientCtx.Err() == nil {
-				select {
-				case destination <- aistudio.Event{Kind: aistudio.EventError, Err: err}:
-				case <-clientCtx.Done():
-				}
-			}
-		}
 		api.SetAccessLogError(requestCtx, requestErr)
 		service.requests.finish(requestID, state)
 		close(destination)
 		if mediaBytes > 1024*1024 || activity.bytes.Load() > 2*1024*1024 {
 			scheduleMemoryRelease()
+		}
+		if temporaryCopies != nil && temporaryCopies.HasCopies() {
+			go func() {
+				if err := temporaryCopies.Cleanup(); err != nil {
+					service.requests.log(accountLabel, "WARN", "临时文件清理失败 | 错误="+err.Error())
+				}
+				if err := lease.Release(); err != nil {
+					service.requests.logRequestProgress(requestID, accountLabel, "WARN", "账户租约释放失败 | 错误="+err.Error())
+				}
+			}()
+		} else {
+			if temporaryCopies != nil {
+				if err := temporaryCopies.Cleanup(); err != nil {
+					service.requests.log(accountLabel, "WARN", "临时文件清理失败 | 错误="+err.Error())
+				}
+			}
+			if err := lease.Release(); err != nil {
+				service.requests.logRequestProgress(requestID, accountLabel, "WARN", "账户租约释放失败 | 错误="+err.Error())
+			}
 		}
 	}()
 	pendingFirst := true
