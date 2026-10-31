@@ -202,7 +202,7 @@ ERROR  account@example.com  WAA Worker 停止失败 | PID=18240 | 耗时=10.002s
 | `备用请求胜出` | 备用请求先解出首个语义事件，原请求取消 | `账户`、`原请求已等待`、`模型` |
 | `原请求胜出` | 原请求先解出首个语义事件，备用请求取消 | `备用账户`、`模型` |
 
-`网络字节` 是当前账户尝试累计读取的上游响应体字节数，`最近网络` 是最近一次读取距日志时刻的时间。`网络字节=0` 表示响应体尚未产生数据；数值增长且 `最近网络` 较短，表示网络仍有数据进入、解码器尚未形成新的语义事件。
+`网络字节` 是当前账户尝试累计读取的上游响应体字节数，`最近网络` 是最近一次读取距日志时刻的时间。`网络字节=0B` 表示响应体尚未产生数据；数值自适应格式化显示（如 `KB`、`MB` 等），数值增长且 `最近网络` 较短，表示网络仍有数据进入、解码器尚未形成新的语义事件。
 
 ```text
 WARN  account@example.com  请求准备等待 | 已等待=15s | 当前=等待上游响应头 | 模型=gemini-3.7-flash
@@ -210,12 +210,12 @@ INFO  account@example.com  请求准备结束 | 等待=47.755s | WAA=1.204s | �
 ```
 
 ```text
-WARN  account@example.com  上游首事件等待 | 已等待=15s | 模型=gemini-3.7-flash | 网络字节=0
+WARN  account@example.com  上游首事件等待 | 已等待=15s | 模型=gemini-3.7-flash | 网络字节=0B
 INFO  account@example.com  上游首事件到达 | 等待=28.447s | 事件=reasoning | 模型=gemini-3.7-flash
 ```
 
 ```text
-WARN  account@example.com  事件流停顿 | 模型=gemini-3.7-flash | 已等待=15s | 最近事件=reasoning | 推理=4 | 正文=0 | 网络字节=18240 | 最近网络=15.001s
+WARN  account@example.com  事件流停顿 | 模型=gemini-3.7-flash | 已等待=15s | 最近事件=reasoning | 推理=4 | 正文=0 | 网络字节=17.81KB | 最近网络=15.001s
 INFO  account@example.com  事件流恢复 | 模型=gemini-3.7-flash | 停顿=1m31.208s | 当前事件=reasoning
 ```
 
@@ -264,7 +264,7 @@ WARN  account@example.com  账号切换 | 模型=gemini-3.7-flash
 | 事件 | 语义 |
 | --- | --- |
 | `文件引用复制` | Drive file 已临时复制到本次目标账户 |
-| `内联附件处理完成` | 本次请求的附件数量、原始字节数与处理耗时 |
+| `内联附件处理完成` | 本次请求的附件数量、原始字节大小与处理耗时 |
 | `临时文件清理失败` | 本次请求的临时 Drive 文件回收失败，原始错误保留 |
 | `转录账号切换` | 转录生成阶段在首个结果前切换候选 |
 | `Bidi 账号切换` | Live/Robotics setup 阶段切换候选 |

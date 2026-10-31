@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -445,5 +446,38 @@ func TestCanDirectInlineMediaThreshold(t *testing.T) {
 	}
 	if canDirectInlineMedia(videoJob) {
 		t.Errorf("expected false for video MIME")
+	}
+}
+
+// TestFormatBytes 验证字节数自适应格式化逻辑
+func TestFormatBytes(t *testing.T) {
+	testCases := []struct {
+		bytes    int64
+		expected string
+	}{
+		{0, "0B"},
+		{512, "512B"},
+		{1023, "1023B"},
+		{1024, "1KB"},
+		{1536, "1.50KB"},
+		{12950448, "12.35MB"},
+		{15 * 1024 * 1024, "15MB"},
+		{1024 * 1024 * 1024, "1GB"},
+		{1099511627776, "1TB"},
+		{-512, "-512B"},
+		{-1024, "-1KB"},
+		{-1536, "-1.50KB"},
+		{-12950448, "-12.35MB"},
+		{-15 * 1024 * 1024, "-15MB"},
+		{-1024 * 1024 * 1024, "-1GB"},
+		{math.MinInt64, "-8388608TB"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("%d", tc.bytes), func(t *testing.T) {
+			if got := FormatBytes(tc.bytes); got != tc.expected {
+				t.Errorf("FormatBytes(%d) = %q, expected %q", tc.bytes, got, tc.expected)
+			}
+		})
 	}
 }

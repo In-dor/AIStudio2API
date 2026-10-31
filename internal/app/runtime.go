@@ -1567,11 +1567,11 @@ func (activity *upstreamActivity) observe(count int) {
 func (activity *upstreamActivity) logFields(now time.Time) string {
 	lastNano := activity.lastNano.Load()
 	if lastNano == 0 {
-		return "网络字节=0"
+		return "网络字节=0B"
 	}
 	return fmt.Sprintf(
-		"网络字节=%d | 最近网络=%s",
-		activity.bytes.Load(), now.Sub(time.Unix(0, lastNano)).Round(time.Millisecond),
+		"网络字节=%s | 最近网络=%s",
+		aistudio.FormatBytes(activity.bytes.Load()), now.Sub(time.Unix(0, lastNano)).Round(time.Millisecond),
 	)
 }
 
@@ -2030,8 +2030,8 @@ func (service *trackedService) runAttempt(
 		}).UploadInlineMediaToLease(ctx, lease, request.Contents, attempt.copies)
 		if err == nil {
 			service.requests.log(accountLabel, "INFO", fmt.Sprintf(
-				"内联附件处理完成 | 附件=%d | 原始=%dB | 耗时=%s",
-				mediaCount, mediaBytes, time.Since(uploadStartedAt).Round(time.Millisecond),
+				"内联附件处理完成 | 附件=%d | 原始=%s | 耗时=%s",
+				mediaCount, aistudio.FormatBytes(mediaBytes), time.Since(uploadStartedAt).Round(time.Millisecond),
 			))
 		}
 	}
