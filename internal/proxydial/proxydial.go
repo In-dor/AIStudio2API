@@ -41,7 +41,7 @@ func Address(proxyURL *url.URL) string {
 
 // Dialer 返回经代理建立 TCP 连接的拨号器，支持 HTTP、HTTPS CONNECT 与 SOCKS5 及其账号密码
 func Dialer(proxyURL *url.URL) (proxy.ContextDialer, error) {
-	direct := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
+	direct := &net.Dialer{Timeout: connectTimeout, KeepAlive: 15 * time.Second}
 	proxyTarget := Address(proxyURL)
 	if proxyURL.Port() == "" && strings.EqualFold(proxyURL.Scheme, "socks5") {
 		return nil, fmt.Errorf("SOCKS5 代理 URL 缺少端口")

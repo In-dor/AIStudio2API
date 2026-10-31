@@ -2,6 +2,7 @@ package aistudio
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,8 +24,8 @@ import (
 )
 
 const (
-	// firefoxPingThreshold 是 Firefox network.http.http2.ping-threshold，连接持续未收到帧达到该时长时发送 PING
-	firefoxPingThreshold = 58 * time.Second
+	// firefoxPingThreshold 是 Firefox network.http.http2.ping-threshold；缩短至 10s 以在流式长思考/静默期间主动发送 HTTP/2 PING 帧穿透代理隧道保活，防止中间专线/NAT 在 15s 空闲阈值时切断连接
+	firefoxPingThreshold = 10 * time.Second
 	// firefoxPingTimeout 是 Firefox network.http.http2.ping-timeout，PING 超过该时长未应答时关闭连接
 	firefoxPingTimeout = 8 * time.Second
 	// firefoxTLSHandshakeTimeout 是 Firefox network.http.tls-handshake-timeout
@@ -149,6 +150,7 @@ type browserResponseBody struct {
 	body    io.ReadCloser
 	source  *fhttp.Response
 	trailer stdhttp.Header
+	pool    *firefoxConnPool
 }
 
 // newBrowserRoundTripper 创建与当前 Camoufox 网络形状一致的传输：经代理时只用 HTTP/2，直连时按 Alt-Svc 改用 HTTP/3
@@ -390,7 +392,9 @@ func (pool *firefoxConnPool) shutdown() {
 	pool.mu.Unlock()
 	for _, list := range conns {
 		for _, conn := range list {
-			go func() { _ = conn.Shutdown(context.Background()) }()
+			if conn != nil {
+				go func(c *http2.ClientConn) { _ = c.Shutdown(context.Background()) }(conn)
+			}
 		}
 	}
 }
@@ -451,7 +455,7 @@ func (transport *browserRoundTripper) RoundTrip(request *stdhttp.Request) (*stdh
 		ProtoMajor:       response.ProtoMajor,
 		ProtoMinor:       response.ProtoMinor,
 		Header:           standardHeader(response.Header),
-		Body:             &browserResponseBody{body: response.Body, source: response, trailer: responseTrailer},
+		Body:             &browserResponseBody{body: response.Body, source: response, trailer: responseTrailer, pool: transport.pool},
 		ContentLength:    response.ContentLength,
 		TransferEncoding: append([]string(nil), response.TransferEncoding...),
 		Close:            response.Close,
@@ -491,6 +495,9 @@ func (transport *browserRoundTripper) roundTripHTTP2(request *fhttp.Request) (*f
 	}()
 	select {
 	case value := <-done:
+		if isAbnormalDisruption(value.err) && transport.pool != nil {
+			transport.pool.shutdown()
+		}
 		return value.response, value.err
 	case <-request.Context().Done():
 		go func() {
@@ -502,10 +509,17 @@ func (transport *browserRoundTripper) roundTripHTTP2(request *fhttp.Request) (*f
 	}
 }
 
+// isAbnormalDisruption 判断是否为非正常断流错误（如 unexpected EOF 或 http2: client connection lost），排除正常的 io.EOF 以及主动取消或超时的 context 错误
+func isAbnormalDisruption(err error) bool {
+	return err != nil && err != io.EOF && !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+}
+
 func (body *browserResponseBody) Read(buffer []byte) (int, error) {
 	read, err := body.body.Read(buffer)
 	if err == io.EOF {
 		body.syncTrailer()
+	} else if isAbnormalDisruption(err) && body.pool != nil {
+		body.pool.shutdown()
 	}
 	return read, err
 }
@@ -517,6 +531,9 @@ func (body *browserResponseBody) Close() error {
 }
 
 func (body *browserResponseBody) syncTrailer() {
+	if body.source == nil {
+		return
+	}
 	clear(body.trailer)
 	for name, values := range body.source.Trailer {
 		body.trailer[name] = append([]string(nil), values...)
