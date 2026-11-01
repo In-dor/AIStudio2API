@@ -32,6 +32,7 @@ export const messages: Record<TranslationKey, string> = {
   'app.status': 'Dienststatus',
   'app.start': 'Dienst starten',
   'app.stop': 'Dienst beenden',
+  'app.invalidConfig': 'Diese Einstellungen haben ungültige Werte und laufen mit dem Standardwert:',
   'app.listenReserved':
     'Der Port von {reserved} ist reserviert, der Dienst lauscht auf {active}. Clients müssen diese Adresse nutzen; die Listen-Adresse fixiert den Port',
   'app.language': 'Sprache',
@@ -258,6 +259,7 @@ export const messages: Record<TranslationKey, string> = {
   'settings.listen': 'Listen-Adresse',
   'settings.previewListen': 'Listen-Adresse der Vorschau',
   'settings.apiKey': 'Lokaler API-Schlüssel',
+  'settings.apiKeyAccounts': 'Konten pro Schlüssel',
   'settings.proxy': 'Standard-Proxy',
   'settings.initTimeout': 'Zeitlimit für die Initialisierung',
   'settings.requestTimeout': 'Zeitlimit für Anfragen',
@@ -279,7 +281,7 @@ export const messages: Record<TranslationKey, string> = {
   'settings.upstreamChannelsHelp':
     'Standard ist Playground. Build ist der alte Kanal, dessen Generierung upstream eingestellt ist; aktiviert laufen abgelehnte Anfragen über Playground',
   'settings.modelMapping': 'Modellzuordnung',
-  'settings.modelMappingHelp': 'Jeden Eintrag als Alias:Modell-ID schreiben, durch Kommas getrennt',
+  'settings.modelMappingHelp': 'Anfragen für den Modellnamen links verwenden das Modell rechts',
   'settings.modelChannels': 'Modellkanäle',
   'settings.mediaOutput': 'Medienausgabe',
   'settings.mediaOutputHelp':
@@ -290,7 +292,7 @@ export const messages: Record<TranslationKey, string> = {
   'settings.mediaBaseURLHelp':
     'Dienstadresse in Medienlinks. Leer verwendet die Adresse der jeweiligen Anfrage.',
   'settings.modelChannelsHelp':
-    'Modell auf einen Kanal beschränken: je Eintrag Modell-ID:playground oder build; auch in den Modelldetails wählbar',
+    'Modell auf einen Kanal beschränken; auch in den Modelldetails wählbar',
   'channel.playground': 'Playground',
   'channel.build': 'Build',
   'channel.assistant': 'Build-Chat',
@@ -335,6 +337,8 @@ export const messages: Record<TranslationKey, string> = {
   'pg.expandCode': 'Code-Snippet maximieren',
   'pg.expandDiagram': 'Diagramm maximieren',
   'pg.functionResponse': 'Funktionsantwort eingeben',
+  'pg.functionInput': 'Eingabe',
+  'pg.functionOutput': 'Ausgabe',
   'pg.mermaidDiagram': 'Mermaid-Diagramm',
   'pg.preview': 'Vorschau',
   'pg.property': 'Eigenschaft',
@@ -1503,6 +1507,23 @@ export const messages: Record<TranslationKey, string> = {
   'settings.listenHelp': 'Listen-Adresse, die Konsole und öffentliche API gemeinsam nutzen.',
   'settings.previewListenHelp':
     'Eigener Ursprung für HTML-Vorschauen im API-Playground, geöffnet mit dem aktuellen Hostnamen und diesem Port, anders als der Listen-Port.',
+  'settings.apiKeyAccountsHelp':
+    'Wählen Sie, welche Konten die Anfragen jedes Schlüssels bearbeiten. Ohne Auswahl kann der Schlüssel alle Konten nutzen',
+  'settings.keyAccountsAll': 'Alle Konten',
+  'settings.keyAccountsSome': 'Ausgewählte Konten',
+  'settings.accountSearch': 'Konten suchen',
+  'settings.accountNone': 'Keine passenden Konten',
+  'settings.keyAccountsClear': 'Alle Konten verwenden',
+  'settings.hedgeModelsNone': 'Kein Modell ausgewählt',
+  'settings.hedgeModelsSome': 'Ausgewählte Modelle',
+  'settings.modelSearch': 'Modelle suchen',
+  'settings.modelNone': 'Keine passenden Modelle',
+  'settings.selectionClear': 'Auswahl aufheben',
+  'settings.aliasPlaceholder': 'Alias',
+  'settings.selectModel': 'Modell wählen',
+  'settings.selectChannel': 'Kanal wählen',
+  'settings.addMapping': 'Zuordnung hinzufügen',
+  'settings.addModelChannel': 'Modell hinzufügen',
   'settings.apiKeyHelp':
     'Mehrere Schlüssel durch Kommas trennen. Leer können nur Seiten auf diesem Rechner die API aufrufen',
   'settings.authPathHelp': 'Kontodatei, Verzeichnis oder mehrere durch Kommas getrennte Pfade.',
@@ -1522,8 +1543,11 @@ export const messages: Record<TranslationKey, string> = {
   'settings.youtubeLinksHelp':
     'YouTube-Links im Text von Nutzernachrichten werden als Video an das Modell gesendet',
   'settings.temporaryChatHelp': 'Die WAA-Vorwärmseite verwendet einen temporären Chat.',
-  'settings.initTimeoutHelp': 'Maximale Dauer der WAA-Initialisierung pro Konto, zum Beispiel 2m.',
-  'settings.requestTimeoutHelp': 'Maximale Laufzeit einer Anfrage, zum Beispiel 5m.',
+  'settings.initTimeoutHelp': 'Maximale Dauer der WAA-Initialisierung pro Konto.',
+  'settings.requestTimeoutHelp': 'Maximale Laufzeit einer Anfrage.',
+  'settings.unitSeconds': 'Sekunden',
+  'settings.unitMinutes': 'Minuten',
+  'settings.timeUnit': 'Zeiteinheit',
   'settings.firstEventHedge': 'Ersatzanfrage bei langsamem ersten Token',
   'settings.firstEventHedgeHelp':
     'Kommt das erste Token zu spät, wird die Anfrage über ein freies Konto erneut gesendet; die zuerst antwortende läuft weiter, die andere bricht ab',
@@ -1536,6 +1560,10 @@ export const messages: Record<TranslationKey, string> = {
     'Jedes Modell und jeder Kanal wartet sein p95 des ersten Tokens der letzten 24 h ab; unter 20 Anfragen keine Ersatzanfrage',
   'settings.firstEventHedgeCustomHint':
     'Zum Vergleich: p95 des ersten Tokens von {model} in den letzten 24 h: {seconds} s',
+  'settings.firstEventHedgeModels': 'Modelle mit Ersatzanfrage',
+  'settings.firstEventHedgeModelsHelp':
+    'Eine Ersatzanfrage zählt auch bei Abbruch als eine Anfrage. Nur gemini-4-argon auf Ultra-Konten hat ein Token-Kontingent; andere Modelle haben Anfragekontingente und werden nicht empfohlen',
+  'settings.environmentLocked': 'Durch die Umgebungsvariable {key} festgelegt; hier nicht änderbar',
   'settings.proxyHelp':
     'HTTP-, HTTPS- oder SOCKS5-Proxy. Mehrere durch Kommas getrennt bilden einen Pool; leer nutzt den Systemproxy',
   'settings.proxyPool': 'Proxy-Pool',

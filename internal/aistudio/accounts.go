@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -253,8 +254,10 @@ type AccountSelection struct {
 	Channel           Channel
 	PreferredChannel  Channel
 	InlineMediaKeys   []InlineMediaKey
-	anyTier           bool
-	anyState          bool
+	// IgnorePlanLimitCooldown 为 true 时套餐限额冷却中的账户照常参与选号
+	IgnorePlanLimitCooldown bool
+	anyTier                 bool
+	anyState                bool
 }
 
 const preferredBootstrapModelID = "gemini-flash-latest"
@@ -302,6 +305,7 @@ type AccountPool struct {
 	lastPickedChannel     map[string]Channel
 	channels              []Channel
 	modelChannels         map[string]Channel
+	apiKeyAccounts        map[string][]string
 	changed               chan struct{}
 	// sessionCheck 以官网页面的方式打开 AI Studio 检查账户会话，为空时认证失败直接标记需要重新登录
 	sessionCheck func(context.Context, *Account) error
@@ -321,10 +325,12 @@ type AccountLease struct {
 	checkedAt             time.Time
 	refreshRuntime        bool
 	channel               Channel
-	operation             sync.Mutex
-	released              bool
-	once                  sync.Once
-	err                   error
+	// ignorePlanLimitCooldown 表示租约按套餐限额回退取得，套餐限额冷却不阻止它发送
+	ignorePlanLimitCooldown bool
+	operation               sync.Mutex
+	released                bool
+	once                    sync.Once
+	err                     error
 	// sessionOnce 使同一租约内的认证失败只检查一次会话
 	sessionOnce sync.Once
 	// sessionErr 是本租约会话检查的结果
@@ -993,6 +999,7 @@ func (p *AccountPool) AcquireAccount(ctx context.Context, accountID string) (*Ac
 
 // AcquireFor 按模型方法账户或资源粘性获取账户槽位
 func (p *AccountPool) AcquireFor(ctx context.Context, selection AccountSelection) (*AccountLease, error) {
+	selection = p.keyScopedSelection(ctx, selection)
 	if selection.ResourceID != "" {
 		if err := p.refreshResource(ctx, selection.ResourceID); err != nil {
 			return nil, err
@@ -1074,8 +1081,22 @@ func (p *AccountPool) AcquireFor(ctx context.Context, selection AccountSelection
 	}
 }
 
+// resourceOwners 返回持有已绑定资源的账户
+func (p *AccountPool) resourceOwners() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var owners []string
+	for _, owner := range p.resources {
+		if !slices.Contains(owners, owner) {
+			owners = append(owners, owner)
+		}
+	}
+	return owners
+}
+
 // TryAcquireFor 尝试获取账户槽位并立即返回当前结果
 func (p *AccountPool) TryAcquireFor(ctx context.Context, selection AccountSelection) (*AccountLease, bool, error) {
+	selection = p.keyScopedSelection(ctx, selection)
 	if selection.ResourceID != "" {
 		if err := p.refreshResource(ctx, selection.ResourceID); err != nil {
 			return nil, false, err
@@ -1153,7 +1174,7 @@ func (p *AccountPool) refreshAndValidateLease(
 		return false, nil
 	}
 	if selection.ResourceID == "" && !selection.anyState {
-		if _, active := accountCooldown(account, lease.CooldownScope(selectionAccessScope(selection)), time.Now()); active {
+		if _, active := selectionCooldown(account, lease.CooldownScope(selectionAccessScope(selection)), selection, time.Now()); active {
 			return false, nil
 		}
 	}
@@ -1329,7 +1350,15 @@ func (l *AccountLease) confirmAuthenticationFailureAt(ctx context.Context, cause
 
 // CoolingDown 返回租约账户当前是否处于全局或指定模型的冷却
 func (l *AccountLease) CoolingDown(modelID string) bool {
-	return l.pool.AccountCoolingDown(l.account.ID, l.CooldownScope(strings.TrimPrefix(strings.TrimSpace(modelID), "models/")))
+	scope := l.CooldownScope(strings.TrimPrefix(strings.TrimSpace(modelID), "models/"))
+	l.pool.mu.Lock()
+	defer l.pool.mu.Unlock()
+	account := l.pool.byID[l.account.ID]
+	if account == nil {
+		return false
+	}
+	_, active := selectionCooldown(account, scope, AccountSelection{IgnorePlanLimitCooldown: l.ignorePlanLimitCooldown}, time.Now())
+	return active
 }
 
 // AccountCoolingDown 返回账户当前是否处于全局或指定模型的冷却
@@ -2318,6 +2347,7 @@ func (p *AccountPool) ClassifyCandidates(
 	selection AccountSelection,
 	warmAccountIDs []string,
 ) (AccountCandidateGroups, error) {
+	selection = p.keyScopedSelection(ctx, selection)
 	selection.ModelID = strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
 	if selection.ResourceID != "" {
 		if err := p.refreshResource(ctx, selection.ResourceID); err != nil {
@@ -2430,7 +2460,7 @@ func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time
 			continue
 		}
 		if selection.ResourceID == "" && !selection.anyState {
-			if cooldown, active := accountCooldown(account, ChannelCooldownScope(candidate.channel, selectionAccessScope(selection)), now); active {
+			if cooldown, active := selectionCooldown(account, ChannelCooldownScope(candidate.channel, selectionAccessScope(selection)), selection, now); active {
 				if earliest.IsZero() || cooldown.Until.Before(earliest) {
 					earliest = cooldown.Until
 				}
@@ -2463,7 +2493,7 @@ func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time
 		return &AccountLease{
 			pool: p, account: account, authGeneration: account.authGeneration,
 			modelAccessGeneration: account.modelAccessGeneration, refreshRuntime: refreshRuntime, checkedAt: now.UTC(),
-			channel: candidate.channel,
+			channel: candidate.channel, ignorePlanLimitCooldown: selection.IgnorePlanLimitCooldown,
 		}, time.Time{}, true, nil
 	}
 	return nil, earliest, waitable, nil
@@ -3397,14 +3427,15 @@ func accountCatalogFingerprint(tier BenefitTier, models []Model) (string, error)
 	return fmt.Sprintf("%x", sha256.Sum256(data)), nil
 }
 
-func accountCooldown(account *Account, modelID string, now time.Time) (CooldownState, bool) {
+// selectionCooldown 返回账户在作用域上对选择生效的冷却，IgnorePlanLimitCooldown 的选择不受套餐限额冷却限制
+func selectionCooldown(account *Account, scope string, selection AccountSelection, now time.Time) (CooldownState, bool) {
 	var selected CooldownState
-	for _, key := range []string{globalCooldownKey, modelID} {
+	for _, key := range []string{globalCooldownKey, scope} {
 		if key == "" {
 			continue
 		}
 		cooldown, exists := account.runtime.Cooldowns[key]
-		if !exists || !cooldown.Active(now) {
+		if !exists || !cooldown.Active(now) || selection.IgnorePlanLimitCooldown && strings.HasPrefix(cooldown.Reason, PlanLimitKind) {
 			continue
 		}
 		if selected.Until.IsZero() || cooldown.Until.After(selected.Until) {
@@ -3412,6 +3443,10 @@ func accountCooldown(account *Account, modelID string, now time.Time) (CooldownS
 		}
 	}
 	return selected, !selected.Until.IsZero()
+}
+
+func accountCooldown(account *Account, modelID string, now time.Time) (CooldownState, bool) {
+	return selectionCooldown(account, modelID, AccountSelection{}, now)
 }
 
 func selectionAccessScope(selection AccountSelection) string {
