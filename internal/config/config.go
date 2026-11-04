@@ -20,8 +20,10 @@ const (
 	defaultPreviewListenAddr  = "127.0.0.1:2050"
 	defaultInitTimeout        = 2 * time.Minute
 	defaultRequestTimeout     = 30 * time.Minute
-	defaultWarmWorkerLimit    = 5
-	defaultMaxActiveWorkers   = 10
+	defaultWarmWorkerLimit    = 10
+	defaultMaxActiveWorkers   = 20
+	camoufoxWarmWorkerLimit   = 5
+	camoufoxMaxActiveWorkers  = 10
 	defaultWarmConcurrency    = 5
 	defaultAccountConcurrency = 2
 )
@@ -43,7 +45,6 @@ var configKeys = [...]string{
 	"UPSTREAM_CHANNELS",
 	"MODEL_MAPPING",
 	"MODEL_CHANNELS",
-	"TEMPORARY_CHAT",
 	"WAA_BACKEND",
 	"MEDIA_OUTPUT",
 	"MEDIA_BASE_URL",
@@ -59,6 +60,7 @@ var configKeys = [...]string{
 	"NONSTREAM_KEEPALIVE",
 	"FAKE_STREAM",
 	"YOUTUBE_LINKS",
+	"STRIP_THOUGHT_SIGNATURES",
 	"SEARCH_MODEL_ALIASES",
 	"GOOGLE_SEARCH",
 	"FIRST_EVENT_HEDGE",
@@ -111,6 +113,7 @@ type Config struct {
 	NonstreamKeepalive     bool
 	FakeStream             bool
 	YouTubeLinks           bool
+	StripThoughtSignatures bool
 	SearchModelAliases     bool
 	GoogleSearch           bool
 	FirstEventHedge        string
@@ -133,7 +136,6 @@ type Config struct {
 	UpstreamChannels       []string
 	ModelMapping           string
 	ModelChannels          string
-	TemporaryChat          bool
 	WAABackend             string
 	MediaOutput            string
 	MediaBaseURL           string
@@ -141,6 +143,18 @@ type Config struct {
 	Invalid []InvalidValue
 	// Environment 是取自进程环境变量、覆盖 .env 的配置键
 	Environment []string
+}
+
+// workerDefaultKeys 是默认值随 WAA 后端变化的键
+var workerDefaultKeys = []string{"WARM_WORKER_LIMIT", "MAX_ACTIVE_WORKERS"}
+
+// defaultsFor 返回 WAA 后端为 backend 时的默认配置，Camoufox 后端的常驻预热账户数与活动 Worker 上限较小
+func defaultsFor(backend string) Config {
+	cfg := Default()
+	if backend == WAABackendCamoufox {
+		cfg.WarmWorkerLimit, cfg.MaxActiveWorkers = camoufoxWarmWorkerLimit, camoufoxMaxActiveWorkers
+	}
+	return cfg
 }
 
 // Default 返回可直接启动的默认配置
@@ -151,6 +165,7 @@ func Default() Config {
 		LogMaxTotalMB:          500,
 		BuildNativeNonstream:   true,
 		IgnoreThoughtSignature: true,
+		StripThoughtSignatures: true,
 		NonstreamKeepalive:     true,
 		SearchModelAliases:     true,
 		FirstEventHedge:        FirstEventHedgeAuto,
@@ -168,7 +183,7 @@ func Default() Config {
 		PerAccountConcurrency:  defaultAccountConcurrency,
 		RoutingStrategy:        "round-robin",
 		UpstreamChannels:       []string{"playground"},
-		WAABackend:             WAABackendCamoufox,
+		WAABackend:             WAABackendSpiderMonkey,
 		MediaOutput:            MediaOutputInline,
 	}
 }
@@ -198,14 +213,14 @@ var configSetters = map[string]func(*Config, string) error{
 	"LOG_FILE":                 boolSetter("LOG_FILE", func(c *Config) *bool { return &c.LogFile }),
 	"ADMIN_AUTH_ENABLED":       boolSetter("ADMIN_AUTH_ENABLED", func(c *Config) *bool { return &c.AdminAuthEnabled }),
 	"BUILD_NATIVE_NONSTREAM":   boolSetter("BUILD_NATIVE_NONSTREAM", func(c *Config) *bool { return &c.BuildNativeNonstream }),
-	"IGNORE_THOUGHT_SIGNATURE": boolSetter("IGNORE_THOUGHT_SIGNATURE", func(c *Config) *bool { return &c.IgnoreThoughtSignature }),
+	"IGNORE_THOUGHT_SIGNATURE": thoughtSignatureSetter("IGNORE_THOUGHT_SIGNATURE"),
 	"NONSTREAM_KEEPALIVE":      boolSetter("NONSTREAM_KEEPALIVE", func(c *Config) *bool { return &c.NonstreamKeepalive }),
 	"FAKE_STREAM":              boolSetter("FAKE_STREAM", func(c *Config) *bool { return &c.FakeStream }),
 	"SEARCH_MODEL_ALIASES":     boolSetter("SEARCH_MODEL_ALIASES", func(c *Config) *bool { return &c.SearchModelAliases }),
 	"GOOGLE_SEARCH":            boolSetter("GOOGLE_SEARCH", func(c *Config) *bool { return &c.GoogleSearch }),
 	"YOUTUBE_LINKS":            boolSetter("YOUTUBE_LINKS", func(c *Config) *bool { return &c.YouTubeLinks }),
+	"STRIP_THOUGHT_SIGNATURES": thoughtSignatureSetter("STRIP_THOUGHT_SIGNATURES"),
 	"CONTINUATION_REWRITE":     boolSetter("CONTINUATION_REWRITE", func(c *Config) *bool { return &c.ContinuationRewrite }),
-	"TEMPORARY_CHAT":           boolSetter("TEMPORARY_CHAT", func(c *Config) *bool { return &c.TemporaryChat }),
 	"LOG_MAX_TOTAL_MB":         intSetter("LOG_MAX_TOTAL_MB", func(c *Config) *int { return &c.LogMaxTotalMB }),
 	"WARM_WORKER_LIMIT":        intSetter("WARM_WORKER_LIMIT", func(c *Config) *int { return &c.WarmWorkerLimit }),
 	"MAX_ACTIVE_WORKERS":       intSetter("MAX_ACTIVE_WORKERS", func(c *Config) *int { return &c.MaxActiveWorkers }),
@@ -243,6 +258,18 @@ func boolSetter(key string, field func(*Config) *bool) func(*Config, string) err
 			return fmt.Errorf("%s 必须是 true 或 false", key)
 		}
 		*field(c) = parsed
+		return nil
+	}
+}
+
+func thoughtSignatureSetter(key string) func(*Config, string) error {
+	return func(c *Config, value string) error {
+		parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return fmt.Errorf("%s 必须是 true 或 false", key)
+		}
+		c.IgnoreThoughtSignature = parsed
+		c.StripThoughtSignatures = parsed
 		return nil
 	}
 }
@@ -414,6 +441,11 @@ func Load(path string) (Config, error) {
 			cfg.Environment = append(cfg.Environment, key)
 		}
 	}
+	if slices.Contains(cfg.Environment, "IGNORE_THOUGHT_SIGNATURE") && !slices.Contains(cfg.Environment, "STRIP_THOUGHT_SIGNATURES") {
+		delete(values, "STRIP_THOUGHT_SIGNATURES")
+	} else if slices.Contains(cfg.Environment, "STRIP_THOUGHT_SIGNATURES") && !slices.Contains(cfg.Environment, "IGNORE_THOUGHT_SIGNATURE") {
+		delete(values, "IGNORE_THOUGHT_SIGNATURE")
+	}
 	for _, key := range configKeys {
 		if value, ok := values[key]; ok {
 			if err := configSetters[key](&cfg, value); err != nil {
@@ -421,7 +453,12 @@ func Load(path string) (Config, error) {
 			}
 		}
 	}
-	defaults := Default().envValues()
+	defaults := defaultsFor(cfg.WAABackend).envValues()
+	for _, key := range workerDefaultKeys {
+		if _, ok := values[key]; !ok {
+			configSetters[key](&cfg, defaults[key])
+		}
+	}
 	for failed := true; failed; {
 		failed = false
 		for _, check := range configChecks {
@@ -448,7 +485,7 @@ func Load(path string) (Config, error) {
 // legacyEnvKeys 是 v0.2.18 及之前的版本保存设置时总会写出的键
 var legacyEnvKeys = []string{
 	"AISTUDIO_AUTH_STATES", "LISTEN_ADDR", "PROXY_API_KEY", "PROXY", "INIT_TIMEOUT", "REQUEST_TIMEOUT", "WARM_WORKER_LIMIT",
-	"MAX_ACTIVE_WORKERS", "WARM_STARTUP_CONCURRENCY", "PER_ACCOUNT_CONCURRENCY", "ROUTING_STRATEGY", "UPSTREAM_CHANNELS", "TEMPORARY_CHAT", "WAA_BACKEND",
+	"MAX_ACTIVE_WORKERS", "WARM_STARTUP_CONCURRENCY", "PER_ACCOUNT_CONCURRENCY", "ROUTING_STRATEGY", "UPSTREAM_CHANNELS", "WAA_BACKEND",
 }
 
 // upgradeEnv 改写旧版本写出的没有注释的全量 .env：四项旧值改为当前值，删去等于默认值的键，返回是否改写
@@ -510,6 +547,7 @@ func (c Config) envValues() map[string]string {
 		"NONSTREAM_KEEPALIVE":      strconv.FormatBool(c.NonstreamKeepalive),
 		"FAKE_STREAM":              strconv.FormatBool(c.FakeStream),
 		"YOUTUBE_LINKS":            strconv.FormatBool(c.YouTubeLinks),
+		"STRIP_THOUGHT_SIGNATURES": strconv.FormatBool(c.StripThoughtSignatures),
 		"SEARCH_MODEL_ALIASES":     strconv.FormatBool(c.SearchModelAliases),
 		"GOOGLE_SEARCH":            strconv.FormatBool(c.GoogleSearch),
 		"FIRST_EVENT_HEDGE":        c.FirstEventHedge,
@@ -532,14 +570,13 @@ func (c Config) envValues() map[string]string {
 		"MODEL_MAPPING":            c.ModelMapping,
 		"MODEL_CHANNELS":           c.ModelChannels,
 		"API_KEY_ACCOUNTS":         c.APIKeyAccounts,
-		"TEMPORARY_CHAT":           strconv.FormatBool(c.TemporaryChat),
 		"WAA_BACKEND":              c.WAABackend,
 		"MEDIA_OUTPUT":             c.MediaOutput,
 		"MEDIA_BASE_URL":           c.MediaBaseURL,
 	}
 }
 
-// Save 将与默认值不同的配置原子写入指定 env 文件，进程环境变量决定的项保留文件中原有的值
+// Save 将与默认值不同的配置原子写入指定 env 文件，进程环境变量决定的项保留文件中原有的值；文件中没有的常驻预热账户数与活动 Worker 上限仍等于原后端的默认值时不写入，随后端取默认值
 func (c Config) Save(path string) error {
 	if err := c.Validate(); err != nil {
 		return err
@@ -548,14 +585,22 @@ func (c Config) Save(path string) error {
 	if err != nil {
 		return err
 	}
-	values, defaults := c.envValues(), Default().envValues()
+	values, defaults := c.envValues(), defaultsFor(c.WAABackend).envValues()
+	previous := Default()
+	if value, ok := saved["WAA_BACKEND"]; ok {
+		_ = configSetters["WAA_BACKEND"](&previous, value)
+	}
+	previousDefaults := defaultsFor(previous.WAABackend).envValues()
 	file := make(map[string]string)
 	for _, key := range configKeys {
-		if slices.Contains(c.Environment, key) {
-			if value, ok := saved[key]; ok {
-				file[key] = value
+		_, inFile := saved[key]
+		switch {
+		case slices.Contains(c.Environment, key):
+			if inFile {
+				file[key] = saved[key]
 			}
-		} else if values[key] != defaults[key] {
+		case slices.Contains(workerDefaultKeys, key) && !inFile && values[key] == previousDefaults[key]:
+		case values[key] != defaults[key]:
 			file[key] = values[key]
 		}
 	}
@@ -833,9 +878,6 @@ func parseEnvValue(value string) (string, error) {
 }
 
 func formatEnvValue(value string) string {
-	if value == "" {
-		return ""
-	}
 	if strings.ContainsAny(value, " \t\r\n#\"'") {
 		return strconv.Quote(value)
 	}

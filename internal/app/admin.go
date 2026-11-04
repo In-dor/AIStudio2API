@@ -30,7 +30,6 @@ type runtimeAdmin struct {
 	requests    *requestRegistry
 	login       aistudio.IsolatedLoginDriver
 	workers     *accountWorkerManager
-	headers     *accountHeaderProvider
 	configPath  string
 	config      config.Config
 	proxies     *aistudio.ProxyPool
@@ -69,12 +68,11 @@ func newRuntimeAdmin(
 	registry *requestRegistry,
 	login aistudio.IsolatedLoginDriver,
 	workers *accountWorkerManager,
-	headers *accountHeaderProvider,
 	cfg config.Config,
 ) *runtimeAdmin {
 	return &runtimeAdmin{
 		lifecycle: lifecycle, pool: pool, store: store, service: service, requests: registry, login: login,
-		workers: workers, headers: headers,
+		workers:    workers,
 		configPath: ".env", config: cfg,
 	}
 }
@@ -104,6 +102,7 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 		ActiveRequests: admin.requests.count(),
 		Accounts:       counts,
 		Camoufox:       api.AdminCamoufox{Ready: camoufoxnative.Installed()},
+		ChromeImport:   chromeauth.Supported,
 	}
 	if download, ok := camoufoxnative.DownloadProgress(); ok {
 		status.Camoufox.Download = &download
@@ -244,6 +243,7 @@ func (admin *runtimeAdmin) readCookieBrowser(ctx context.Context, browser *api.C
 	if err != nil {
 		return nil, err
 	}
+	browser.DeviceBound = deviceBoundSession(state)
 	return chromeauth.DiscoverCookieAccounts(ctx, &state, admin.effectiveProxy(""))
 }
 
@@ -263,7 +263,12 @@ func (admin *runtimeAdmin) DiscoverCookieAccounts(ctx context.Context, input api
 	if err != nil {
 		return nil, invalidAccount(err)
 	}
-	return cookieAccountEntries(api.CookieBrowser{}, accounts, admin.accountIDs()), nil
+	return cookieAccountEntries(api.CookieBrowser{DeviceBound: deviceBoundSession(state)}, accounts, admin.accountIDs()), nil
+}
+
+// deviceBoundSession 表示 Cookie 带 __Secure-1PSIDRTS，会话绑定签发它的设备
+func deviceBoundSession(state aistudio.StorageState) bool {
+	return slices.ContainsFunc(state.Cookies, func(cookie aistudio.StateCookie) bool { return cookie.Name == "__Secure-1PSIDRTS" })
 }
 
 // cookieAccountEntries 以 template 为模板为每个会话账户生成一项并标记已导入的账户，没有账户时只返回 template
@@ -403,6 +408,11 @@ func (admin *runtimeAdmin) ImportAccountState(ctx context.Context, input api.Acc
 	if err != nil {
 		return api.AdminAccount{}, err
 	}
+	if input.RenewalToken != "" {
+		if err := admin.savePairingRenewal(account.ID, input.RenewalToken); err != nil {
+			return api.AdminAccount{}, err
+		}
+	}
 	admin.requests.log("auth", "INFO", "认证状态账户已导入 | 账户="+account.Label)
 	return account, nil
 }
@@ -430,18 +440,13 @@ func (admin *runtimeAdmin) addAccount(
 	if strings.TrimSpace(account.Config.Proxy) == "" {
 		account.SetPoolProxy(admin.proxies.Next())
 	}
-	if err := admin.headers.Add(account); err != nil {
-		return api.AdminAccount{}, errors.Join(err, admin.store.Delete(account))
-	}
 	if err := admin.workers.Add(account); err != nil {
-		return api.AdminAccount{}, errors.Join(err, admin.headers.Remove(account.ID), admin.store.Delete(account))
+		return api.AdminAccount{}, errors.Join(err, admin.store.Delete(account))
 	}
 	if err := admin.service.changeModels(func() error {
 		return admin.pool.Add(account)
 	}); err != nil {
-		return api.AdminAccount{}, errors.Join(
-			err, admin.workers.Remove(account.ID), admin.headers.Remove(account.ID), admin.store.Delete(account),
-		)
+		return api.AdminAccount{}, errors.Join(err, admin.workers.Remove(account.ID), admin.store.Delete(account))
 	}
 	if err := publishLease.Release(); err != nil {
 		return api.AdminAccount{}, err
@@ -476,24 +481,17 @@ func (admin *runtimeAdmin) UpdateAccount(ctx context.Context, accountID string, 
 	if accountConfig.Proxy == "" && !admin.proxies.Available(account.PoolProxy("")) {
 		account.SetPoolProxy(admin.proxies.Next())
 	}
-	headerUpdate, err := admin.headers.prepareUpdate(account, accountConfig)
-	if err != nil {
-		return api.AdminAccount{}, errors.Join(err, lease.Release())
-	}
 	workerUpdate, err := admin.workers.prepareUpdate(account, accountConfig)
 	if err != nil {
-		headerUpdate.Discard()
 		return api.AdminAccount{}, errors.Join(err, lease.Release())
 	}
 	if err := admin.service.changeModels(func() error {
 		return lease.SaveConfig(accountConfig)
 	}); err != nil {
 		workerUpdate.Discard()
-		headerUpdate.Discard()
 		return api.AdminAccount{}, errors.Join(err, lease.Release())
 	}
 	workerUpdate.Commit()
-	headerUpdate.Commit()
 	if err := lease.Release(); err != nil {
 		return api.AdminAccount{}, err
 	}
@@ -527,7 +525,7 @@ func (admin *runtimeAdmin) DeleteAccount(_ context.Context, accountID string) er
 		return accountOperationError(err)
 	}
 	admin.service.removeAccountModelRetry(accountID)
-	if err := errors.Join(admin.workers.Remove(accountID), admin.headers.Remove(accountID)); err != nil {
+	if err := admin.workers.Remove(accountID); err != nil {
 		return err
 	}
 	admin.requests.log("auth", "INFO", "账户已删除 | 账户="+account.Label)
@@ -815,6 +813,7 @@ func adminAccountDTO(status aistudio.AccountStatus) api.AdminAccount {
 		ID: status.ID, Label: status.Label, Enabled: status.Enabled, State: string(status.State),
 		Proxy: status.Proxy, Egress: status.Egress, Locale: status.Locale, Timezone: status.Timezone,
 		Models: status.Models, BenefitTier: status.BenefitTier, Message: status.Message,
+		PairingRenewedAt: pairingRenewedAt(status.Directory),
 	}
 }
 
@@ -867,13 +866,20 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if err != nil {
 		return api.RuntimeConfig{}, invalidConfigError(fmt.Errorf("REQUEST_TIMEOUT 无效: %w", err))
 	}
+	ignoreThoughtSig := value.IgnoreThoughtSignature
+	if value.IgnoreThoughtSignature != saved.IgnoreThoughtSignature {
+		ignoreThoughtSig = value.IgnoreThoughtSignature
+	} else if value.StripThoughtSignatures != saved.StripThoughtSignatures {
+		ignoreThoughtSig = value.StripThoughtSignatures
+	}
 	cfg := config.Config{
 		AutoStart:      value.AutoStart,
 		RequestBodyLog: value.RequestBodyLog,
 		LogFile:        value.LogFile, LogMaxTotalMB: value.LogMaxTotalMB,
 		AdminAuthEnabled: value.AdminAuthEnabled, AdminUsername: strings.TrimSpace(value.AdminUsername), AdminPassword: password,
 		BuildNativeNonstream:   value.BuildNativeNonstream,
-		IgnoreThoughtSignature: value.IgnoreThoughtSignature,
+		IgnoreThoughtSignature: ignoreThoughtSig,
+		StripThoughtSignatures: ignoreThoughtSig,
 		NonstreamKeepalive:     value.NonstreamKeepalive, FakeStream: value.FakeStream, YouTubeLinks: value.YouTubeLinks,
 		SearchModelAliases:     value.SearchModelAliases, GoogleSearch: value.GoogleSearch,
 		ContinuationRewrite:    value.ContinuationRewrite, ContinuationPrompt: strings.TrimSpace(value.ContinuationPrompt),
@@ -887,7 +893,6 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		ModelMapping:           strings.TrimSpace(value.ModelMapping),
 		ModelChannels:          strings.TrimSpace(value.ModelChannels),
 		APIKeyAccounts:         strings.TrimSpace(value.APIKeyAccounts),
-		TemporaryChat:          value.TemporaryChat,
 		WAABackend:             value.WAABackend,
 		MediaOutput:            strings.ToLower(strings.TrimSpace(value.MediaOutput)),
 		MediaBaseURL:           strings.TrimSpace(value.MediaBaseURL),
@@ -900,6 +905,9 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	}
 	admin.pool.SetRoutingStrategy(cfg.RoutingStrategy)
 	admin.pool.SetModelChannels(modelChannels(cfg.ModelChannels))
+	if admin.service != nil {
+		admin.service.SetIgnoreThoughtSignature(cfg.IgnoreThoughtSignature)
+	}
 	admin.requests.log("service", "INFO", "服务配置已保存")
 	models, _ := admin.CatalogModels(context.Background())
 	admin.requests.publish(api.AdminEvent{Type: "models", Data: map[string]any{"models": models}})
@@ -1174,6 +1182,7 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		AdminPasswordSet: cfg.AdminPassword != "", SavedAdminPassword: cfg.AdminPassword,
 		BuildNativeNonstream:   cfg.BuildNativeNonstream,
 		IgnoreThoughtSignature: cfg.IgnoreThoughtSignature,
+		StripThoughtSignatures: cfg.StripThoughtSignatures,
 		NonstreamKeepalive:     cfg.NonstreamKeepalive, FakeStream: cfg.FakeStream, YouTubeLinks: cfg.YouTubeLinks,
 		SearchModelAliases:     cfg.SearchModelAliases, GoogleSearch: cfg.GoogleSearch,
 		ContinuationRewrite:    cfg.ContinuationRewrite, ContinuationPrompt: cfg.ContinuationPrompt,
@@ -1189,7 +1198,6 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		ModelMapping:           cfg.ModelMapping,
 		ModelChannels:          cfg.ModelChannels,
 		APIKeyAccounts:         cfg.APIKeyAccounts,
-		TemporaryChat:          cfg.TemporaryChat,
 		WAABackend:             cfg.WAABackend,
 		MediaOutput:            cfg.MediaOutput,
 		MediaBaseURL:           cfg.MediaBaseURL,

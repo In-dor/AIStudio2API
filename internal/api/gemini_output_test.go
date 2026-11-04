@@ -228,7 +228,7 @@ func TestGeminiGroundingMetadataInResponse(t *testing.T) {
 			{Kind: aistudio.EventText, Text: "Answer"},
 		},
 	}
-	resp := buildGeminiResponse(aistudio.GenerateRequest{ID: "req-1", Model: "gemini-3.8-flash"}, []generationResult{result})
+	resp := buildGeminiResponse(aistudio.GenerateRequest{ID: "req-1", Model: "gemini-3.8-flash"}, nil, []generationResult{result})
 	candidates, ok := resp["candidates"].([]any)
 	if !ok || len(candidates) != 1 {
 		t.Fatalf("expected 1 candidate, got %#v", resp["candidates"])
