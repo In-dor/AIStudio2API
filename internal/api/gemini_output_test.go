@@ -240,7 +240,7 @@ func TestGeminiGroundingMetadataInResponse(t *testing.T) {
 }
 
 func TestDecodeGeminiJSON_InlineDataSnakeCase(t *testing.T) {
-	raw := `{"contents":[{"role":"user","parts":[{"inline_data":{"mime_type":"image/png","data":"aGVsbG8="}}]}]}`
+	raw := `{"contents":[{"role":"user","parts":[{"inline_data":{"mime_type":"image/png","data":"iVBORw0KGgo="}}]}]}`
 	req := httptest.NewRequest("POST", "/v1beta/models/gemini-2.5-flash:generateContent", strings.NewReader(raw))
 	var geminiReq geminiRequest
 	if err := decodeGeminiJSON(req, &geminiReq); err != nil {
@@ -259,8 +259,8 @@ func TestDecodeGeminiJSON_InlineDataSnakeCase(t *testing.T) {
 	if parts[0].InlineData.MIME != "image/png" {
 		t.Errorf("expected MIME image/png, got %s", parts[0].InlineData.MIME)
 	}
-	if string(parts[0].InlineData.Data) != "hello" {
-		t.Errorf("expected data hello, got %s", string(parts[0].InlineData.Data))
+	if string(parts[0].InlineData.Data) != "\x89PNG\r\n\x1a\n" {
+		t.Errorf("expected PNG header, got %q", string(parts[0].InlineData.Data))
 	}
 }
 
