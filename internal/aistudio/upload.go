@@ -1279,12 +1279,13 @@ func (s *PooledService) prewarmInlineMediaAsync(target *AccountLease, jobs []upl
 	}
 }
 
-// UploadInlineMediaToLease 把内联附件改写为目标账户 Drive 文件的引用，同一账户已上传过的相同内容直接引用，闲置超过 inlineMediaIdle 的旧文件在本次请求结束时删除
+// UploadInlineMediaToLease 把内联附件改写为目标账户 Drive 文件的引用，keepImages 为真时 CreateInteractionStream 可内联的图片保持内联，同一账户已上传过的相同内容直接引用，闲置超过 inlineMediaIdle 的旧文件在本次请求结束时删除
 func (s *PooledService) UploadInlineMediaToLease(
 	ctx context.Context,
 	target *AccountLease,
 	contents []Content,
 	temporary *TemporaryFileCopies,
+	keepImages bool,
 ) ([]Content, *TemporaryFileCopies, error) {
 	if target.Channel() == ChannelBuild || target.Channel() == ChannelAssistant {
 		// Build 代理的 Gemini API 请求直接携带 inlineData，写代码助手在发送时把内联数据上传为附件引用
@@ -1313,7 +1314,7 @@ func (s *PooledService) UploadInlineMediaToLease(
 	for contentIndex := range rewritten {
 		for index := range rewritten[contentIndex].Parts {
 			part := &rewritten[contentIndex].Parts[index]
-			if part.InlineData == nil {
+			if part.InlineData == nil || keepImages && InteractionInlineMIME(part.InlineData.MIME) {
 				continue
 			}
 			if part.InlineData.MIME == "" || len(part.InlineData.Data) == 0 {
@@ -1365,8 +1366,8 @@ func (s *PooledService) UploadInlineMediaToLease(
 		return rewritten, temporary, nil
 	}
 
-	// Case 2: Fast Direct Inline Path (uncached media <= 15 MiB and no video, or account lacks Drive auth)
-	if canDirectInlineMedia(pending) || s.client.isDriveAuthMissing(targetID) {
+	// Case 2: Fast Direct Inline Path (uncached media <= 15 MiB and no video on GenerateContent, or account lacks Drive auth)
+	if (!keepImages && canDirectInlineMedia(pending)) || s.client.isDriveAuthMissing(targetID) {
 		temporary.release = s.useInlineMedia(used)
 		if len(expired) > 0 && !s.client.isDriveAuthMissing(targetID) {
 			go s.deleteExpiredInlineMediaAsync(target, expired)
@@ -1388,8 +1389,13 @@ func (s *PooledService) UploadInlineMediaToLease(
 		return rewritten, temporary, nil
 	}
 
-	// Case 3: Synchronous Drive Upload Path (uncached media > 15 MiB or contains video)
+	// Case 3: Synchronous Drive Upload Path (uncached media > 15 MiB, contains video, or non-image on InteractionStream)
+	var folder string
+	var folderErr error
+	var lookup sync.WaitGroup
+	lookup.Go(func() { folder, folderErr = s.client.appFolder(targetCtx, targetID) })
 	token, err := s.client.GenerateAccessToken(targetCtx, targetID)
+	lookup.Wait()
 	if err != nil {
 		temporary.release = s.useInlineMedia(used)
 		if driveAuthorizationMissing(err) {
@@ -1403,17 +1409,20 @@ func (s *PooledService) UploadInlineMediaToLease(
 	for _, id := range expired {
 		temporary.copies = append(temporary.copies, temporaryDriveCopy{id: id, token: token, bound: true})
 	}
+	if folderErr != nil {
+		temporary.release = s.useInlineMedia(used)
+		if DefinitiveAuthenticationFailure(folderErr) {
+			folderErr = errors.Join(folderErr, target.ConfirmAuthenticationFailure(targetCtx, folderErr))
+		}
+		return nil, nil, errors.Join(folderErr, temporary.Cleanup())
+	}
 
 	drive, ok := s.client.transport.(DriveTransport)
 	if !ok {
+		temporary.release = s.useInlineMedia(used)
 		return nil, nil, errors.Join(fmt.Errorf("transport does not support Drive"), temporary.Cleanup())
 	}
 	uploadCtx, cancelUploads := context.WithCancel(targetCtx)
-	folder, err := s.client.appFolder(uploadCtx, targetID)
-	if err != nil {
-		cancelUploads()
-		return nil, nil, errors.Join(err, temporary.Cleanup())
-	}
 
 	sem := make(chan struct{}, maxConcurrentDriveUploads)
 	resultChannel := make(chan uploadResult, len(pending))
@@ -1601,8 +1610,17 @@ func uriComponent(value string) string {
 	return strings.NewReplacer("+", "%20", "%21", "!", "%27", "'", "%28", "(", "%29", ")", "%2A", "*").Replace(url.QueryEscape(value))
 }
 
-// loadDriveDiscovery 在账户第一次经 gapi 上传前按官网页面读取 Drive v3 discovery 文档，每个账户读取一次
+// loadDriveDiscovery 在账户第一次经 gapi 上传前按官网页面读取 Drive v3 discovery 文档，每个账户读取一次，同时上传的多个文件等待同一次读取
 func (t *MakerSuiteHTTPTransport) loadDriveDiscovery(ctx context.Context, lease *AccountLease, client *http.Client, gapi http.Header, apiKey string) error {
+	account := lease.Account()
+	_, err, _ := t.driveDiscovery.Do(account.ID, func() (any, error) {
+		return nil, t.readDriveDiscovery(ctx, lease, client, gapi, apiKey)
+	})
+	return err
+}
+
+// readDriveDiscovery 读取账户尚未读取过的 Drive v3 discovery 文档
+func (t *MakerSuiteHTTPTransport) readDriveDiscovery(ctx context.Context, lease *AccountLease, client *http.Client, gapi http.Header, apiKey string) error {
 	account := lease.Account()
 	t.driveMu.Lock()
 	loaded := t.driveDiscovered[account.ID]

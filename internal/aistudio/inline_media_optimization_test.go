@@ -481,3 +481,102 @@ func TestFormatBytes(t *testing.T) {
 		})
 	}
 }
+
+type testDriveRPCTransport struct {
+	*testRPCTransport
+	mu      sync.Mutex
+	uploads []UploadRequest
+}
+
+func (d *testDriveRPCTransport) UploadDrive(_ context.Context, _ string, _ string, req UploadRequest) (FileRef, error) {
+	d.mu.Lock()
+	d.uploads = append(d.uploads, req)
+	idx := len(d.uploads)
+	d.mu.Unlock()
+	return FileRef{ID: fmt.Sprintf("drive-uploaded-%d", idx), Name: req.Name, MIME: req.MIME}, nil
+}
+
+func (d *testDriveRPCTransport) DownloadDrive(_ context.Context, _, _, _ string) (MediaStream, error) {
+	return MediaStream{}, fmt.Errorf("not implemented")
+}
+
+func (d *testDriveRPCTransport) DeleteDrive(_ context.Context, _, _, _ string) error {
+	return nil
+}
+
+// TestUploadInlineMediaKeepImages 验证 keepImages=true 时图片保持内联、非图片同步上传 Drive，keepImages=false 时小附件走快速直传内联
+func TestUploadInlineMediaKeepImages(t *testing.T) {
+	ctx := context.Background()
+	base := &testRPCTransport{
+		handler: func(req RPCRequest) (*RPCResponse, error) {
+			switch req.Method {
+			case "GenerateAccessToken":
+				return &RPCResponse{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{JSONProtobufContentType}},
+					Body:       io.NopCloser(strings.NewReader(`["mock-token"]`)),
+				}, nil
+			case "GetAppFolder":
+				return &RPCResponse{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{JSONProtobufContentType}},
+					Body:       io.NopCloser(strings.NewReader(`["mock-folder"]`)),
+				}, nil
+			}
+			return &RPCResponse{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{JSONProtobufContentType}},
+				Body:       io.NopCloser(strings.NewReader(`["ok"]`)),
+			}, nil
+		},
+	}
+	transport := &testDriveRPCTransport{testRPCTransport: base}
+	model := Model{ID: "gemini-omni-flash", Methods: []string{"generateContent"}}
+	acc := &Account{
+		ID:      "acc-omni",
+		Config:  AccountConfig{Enabled: true},
+		State:   AccountReady,
+		Models:  []Model{model},
+		runtime: accountRuntimeState{Resources: make(map[string]ResourceBinding)},
+	}
+	pool := NewAccountPool([]*Account{acc}, 2)
+	client := NewClient(ClientOptions{Transport: transport})
+	service := NewPooledService(pool, client)
+
+	lease, err := pool.AcquireFor(ctx, AccountSelection{AccountID: "acc-omni", anyState: true})
+	if err != nil {
+		t.Fatalf("AcquireFor failed: %v", err)
+	}
+	defer func() { _ = lease.Release() }()
+
+	contents := []Content{
+		{
+			Role: RoleUser,
+			Parts: []Part{
+				{InlineData: &Blob{MIME: "image/png", Data: []byte("png-image-bytes")}, DisplayName: "frame.png"},
+				{InlineData: &Blob{MIME: "application/pdf", Data: []byte("%PDF-1.4 mock")}, DisplayName: "doc.pdf"},
+			},
+		},
+	}
+
+	rewritten, copies, err := service.UploadInlineMediaToLease(ctx, lease, contents, nil, true)
+	if err != nil {
+		t.Fatalf("UploadInlineMediaToLease(keepImages=true) failed: %v", err)
+	}
+	defer func() { _ = copies.Cleanup() }()
+
+	// 图片应保留为 InlineData，不上传 Drive
+	if rewritten[0].Parts[0].InlineData == nil || rewritten[0].Parts[0].File != nil {
+		t.Fatalf("expected image part to stay inline when keepImages=true, got %+v", rewritten[0].Parts[0])
+	}
+	// PDF 在 InteractionStream 中不支持内联，必须同步上传 Drive 并改写为 File 引用
+	if rewritten[0].Parts[1].File == nil || rewritten[0].Parts[1].InlineData != nil {
+		t.Fatalf("expected non-image PDF part to be uploaded to Drive when keepImages=true, got %+v", rewritten[0].Parts[1])
+	}
+	transport.mu.Lock()
+	uploadCount := len(transport.uploads)
+	transport.mu.Unlock()
+	if uploadCount != 1 {
+		t.Fatalf("expected exactly 1 synchronous Drive upload (PDF only), got %d", uploadCount)
+	}
+}
