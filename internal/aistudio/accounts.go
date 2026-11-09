@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/mail"
 	"os"
@@ -396,6 +397,8 @@ type AccountPool struct {
 	channels              []Channel
 	modelChannels         map[string]Channel
 	apiKeyAccounts        map[string][]string
+	modelAccounts         map[string][]string
+	accountOrder          map[string]int
 	changed               chan struct{}
 	// sessionCheck 以官网页面的方式打开 AI Studio 检查账户会话，为空时认证失败直接标记需要重新登录
 	sessionCheck func(context.Context, *Account) error
@@ -1100,7 +1103,7 @@ func (p *AccountPool) AcquireAccount(ctx context.Context, accountID string) (*Ac
 
 // AcquireFor 按模型方法账户或资源粘性获取账户槽位
 func (p *AccountPool) AcquireFor(ctx context.Context, selection AccountSelection) (*AccountLease, error) {
-	selection = p.keyScopedSelection(ctx, selection)
+	selection = p.scopedSelection(ctx, selection)
 	if selection.ResourceID != "" {
 		if err := p.refreshResource(ctx, selection.ResourceID); err != nil {
 			return nil, err
@@ -1210,7 +1213,7 @@ func (p *AccountPool) resourceOwners() []string {
 
 // TryAcquireFor 尝试获取账户槽位并立即返回当前结果
 func (p *AccountPool) TryAcquireFor(ctx context.Context, selection AccountSelection) (*AccountLease, bool, error) {
-	selection = p.keyScopedSelection(ctx, selection)
+	selection = p.scopedSelection(ctx, selection)
 	if selection.ResourceID != "" {
 		if err := p.refreshResource(ctx, selection.ResourceID); err != nil {
 			return nil, false, err
@@ -1307,15 +1310,19 @@ func (p *AccountPool) noEligibleErrorLocked(selection AccountSelection) error {
 		return errNoAccounts
 	}
 	selection.ModelID = strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
+	scope, bound := p.modelAccounts[selection.ModelID]
 	var reasons []string
 	for _, account := range p.accounts {
-		if account.Config.Enabled && account.State == AccountReady {
+		if account.Config.Enabled && account.State == AccountReady || bound && !slices.Contains(scope, account.ID) {
 			continue
 		}
 		if selection.ModelID != "" && !p.accountSupportsAnyChannelLocked(account, selection) {
 			continue
 		}
 		reasons = append(reasons, accountStateReason(account))
+	}
+	if len(reasons) == 0 && bound {
+		return fmt.Errorf("%w：模型 %s 绑定的账户都无法调用", ErrNoEligibleAccount, selection.ModelID)
 	}
 	if len(reasons) == 0 {
 		return ErrNoEligibleAccount
@@ -2034,7 +2041,7 @@ func (p *AccountPool) CandidateStatesForScope(
 	return result
 }
 
-// PreferWarmPool 按权益分层轮选初始热账户
+// PreferWarmPool 按权益分层轮选初始热账户，fill-first 时 ACCOUNT_ORDER 列出的账户在前
 func (p *AccountPool) PreferWarmPool(accountIDs []string) []string {
 	type warmCandidate struct {
 		id       string
@@ -2081,6 +2088,13 @@ func (p *AccountPool) PreferWarmPool(accountIDs []string) []string {
 		if !added {
 			break
 		}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.routingStrategy != "round-robin" {
+		sort.SliceStable(result, func(left int, right int) bool {
+			return p.accountRankLocked(result[left]) < p.accountRankLocked(result[right])
+		})
 	}
 	return result
 }
@@ -2443,7 +2457,7 @@ func (p *AccountPool) ClassifyCandidates(
 	selection AccountSelection,
 	warmAccountIDs []string,
 ) (AccountCandidateGroups, error) {
-	selection = p.keyScopedSelection(ctx, selection)
+	selection = p.scopedSelection(ctx, selection)
 	selection.ModelID = strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
 	if selection.ResourceID != "" {
 		if err := p.refreshResource(ctx, selection.ResourceID); err != nil {
@@ -2750,6 +2764,10 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 		last := p.lastPicked[selectionAccessScope(selection)]
 		start := sort.Search(len(indices), func(index int) bool { return p.accounts[indices[index]].ID > last })
 		indices = append(indices[start:], indices[:start]...)
+	} else {
+		sort.SliceStable(indices, func(left, right int) bool {
+			return p.accountRankLocked(p.accounts[indices[left]].ID) < p.accountRankLocked(p.accounts[indices[right]].ID)
+		})
 	}
 	if len(selection.InlineMediaKeys) > 0 && len(indices) > 1 {
 		now := time.Now().UTC()
@@ -2766,6 +2784,12 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 				return leftHits > rightHits
 			}
 			if leftHits > 0 {
+				if p.routingStrategy != "round-robin" {
+					leftRank, rightRank := p.accountRankLocked(p.accounts[indices[left]].ID), p.accountRankLocked(p.accounts[indices[right]].ID)
+					if leftRank != rightRank {
+						return leftRank < rightRank
+					}
+				}
 				return p.accounts[indices[left]].ID < p.accounts[indices[right]].ID
 			}
 			return false
@@ -2777,6 +2801,14 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 		})
 	}
 	return indices, nil
+}
+
+// accountRankLocked 返回账户在 ACCOUNT_ORDER 中的位置，未列出的账户排在最后
+func (p *AccountPool) accountRankLocked(accountID string) int {
+	if rank, listed := p.accountOrder[accountID]; listed {
+		return rank
+	}
+	return math.MaxInt
 }
 
 // inlineMediaHitsLocked 计算账户中已缓存且未过期的内联附件命中数量
