@@ -92,7 +92,7 @@ Camoufox 按以下顺序定位，只使用发行目录 `application.ini` 中 `Ve
 3. 可执行文件旁的同名目录
 4. Windows 本机 Camoufox 缓存
 
-版本不符的候选被跳过；都没有时自动下载当前平台的固定版本。下载失败时，错误给出发行包地址与 `runtime/camoufox/` 的绝对路径，手动下载解压到该目录后不再下载。Camoufox 在报告 WebDriver BiDi 端点前退出时，错误带上退出码与 Camoufox 最后 20 行输出；输出含 `cannot open shared object file` 时，错误只写明退出码与 `ldd` 查到的 Camoufox 及其依赖库缺少的全部系统库，Debian 系发行版另附安装这些库与 Xvfb 的 `apt-get satisfy` 命令。没有 `DISPLAY` 且找不到 Xvfb 时，错误同样附上该命令。
+版本不符的候选被跳过；都没有时自动下载当前平台的固定版本。下载失败时，错误给出发行包地址与 `runtime/camoufox/` 的绝对路径，手动下载解压到该目录后不再下载。`CAMOUFOX_PATH` 以外的 Camoufox 在 Windows 上使用前删除 `fonts` 目录中 Twemoji 以外的字体。Camoufox 在报告 WebDriver BiDi 端点前退出时，错误带上退出码与 Camoufox 最后 20 行输出；输出含 `cannot open shared object file` 时，错误只写明退出码与 `ldd` 查到的 Camoufox 及其依赖库缺少的全部系统库，Debian 系发行版另附安装这些库与 Xvfb 的 `apt-get satisfy` 命令。没有 `DISPLAY` 且找不到 Xvfb 时，错误同样附上该命令。
 
 日常启动只需运行二进制或 Go 入口，再从管理页面启动生成服务：
 
@@ -325,7 +325,7 @@ Worker 容量由热池目标、活动上限和单账户并发共同约束。活�
 
 故障重置先等待同账户的活动请求释放租约；等待期间该账户暂停接收新请求。客户端取消只结束自身请求。启动预热在官网 Run 按钮启用后提交，请求在发送前再次检查账户冷却状态。
 
-额度冷却按 `quota_unit`、`quota_limit`、`quota_metric`、错误文案依次判定周期。明确的每日限额在美国太平洋时间次日零点恢复；分钟限额按有效的 `window_start_time` 恢复；通用 429 冷却一分钟。写明恢复时间的套餐限额（`You've reached your usage limit for this model (resets in 10 hours, 2 minutes)`）冷却到该时间；没有重试时间的套餐限额（`You've reached your usage limit`）按同一账户同一 scope 的连续次数冷却 1、5、15、30、60 分钟，冷却未结束时的并发失败沿用当前期限，该 scope 成功一次后从 1 分钟重新开始；订阅模型遇到额度错误时，后台立即刷新该账户的权益与目录，同一账户每分钟最多一次。`RetryInfo` 与 `Retry-After` 提供的重试时间优先。错误列出的额度项上限全部为 0（`limit: 0`）时冷却类型为无配额，期限同样按上述规则。全局范围由额度元数据确认，其余错误只冷却失败模型或能力 scope；正文后的额度错误与 Live 会话错误使用同一规则。全部候选账户都在冷却且最早恢复晚于 1 分钟时，套餐限额与每日限额冷却中的账户仍接收请求：上游按每个请求判定是否放行，用尽后较短的请求仍可能完成；同一请求再收到这两种限额拒绝时按上游原因冷却并返回该 429，不再换账户。
+额度冷却按 `quota_unit`、`quota_limit`、`quota_metric`、错误文案依次判定周期。明确的每日限额在美国太平洋时间次日零点恢复；分钟限额按有效的 `window_start_time` 恢复；通用 429 冷却一分钟。写明恢复时间的套餐限额（`You've reached your usage limit for this model (resets in 10 hours, 2 minutes)`）冷却到该时间；没有重试时间的套餐限额（`You've reached your usage limit` 或 Build 写代码助手步骤带每用户额度标记）按同一账户同一 scope 的连续次数冷却 1、5、15、30、60 分钟，冷却未结束时的并发失败沿用当前期限，该 scope 成功一次后从 1 分钟重新开始；订阅模型遇到额度错误时，后台立即刷新该账户的权益与目录，同一账户每分钟最多一次。`RetryInfo` 与 `Retry-After` 提供的重试时间优先。错误列出的额度项上限全部为 0（`limit: 0`）时冷却类型为无配额，期限同样按上述规则。全局范围由额度元数据确认，其余错误只冷却失败模型或能力 scope；正文后的额度错误与 Live 会话错误使用同一规则。全部候选账户都在冷却且最早恢复晚于 1 分钟时，套餐限额与每日限额冷却中的账户仍接收请求：上游按每个请求判定是否放行，用尽后较短的请求仍可能完成；同一请求再收到这两种限额拒绝时按上游原因冷却并返回该 429，不再换账户。
 
 账户状态：
 
@@ -385,7 +385,7 @@ Worker 容量由热池目标、活动上限和单账户并发共同约束。活�
 | 登录与刷新 | `POST /api/accounts/{id}/login`、`POST /api/accounts/{id}/refresh`、`GET /api/login-view/{view}`（WebSocket） |
 | 远程配对 | `GET /api/pairing`、`POST /api/pairing`、`POST /api/pairing/accounts`、`PUT /api/pairing/accounts/{account}/cookies` |
 | 生成服务 | `POST /api/control/start`、`POST /api/control/stop` |
-| 配置 | `GET /api/config`、`PUT /api/config` |
+| 配置 | `GET /api/config`、`PUT /api/config`、`GET /api/paths?path=`（列出服务所在机器的目录与账户状态文件 `storage-state.json`，`path=roots` 列出文件系统根） |
 | 冷却与请求 | `GET /api/cooldowns`、`GET /api/requests`、`POST /api/requests/{id}/cancel` |
 | 用量与正文 | `GET /api/usage`、`GET /api/usage/records`、`GET /api/usage/records.csv`、`GET /api/requests/{id}/body` |
 | 日志与事件 | `DELETE /api/logs`、`GET /api/events` |
