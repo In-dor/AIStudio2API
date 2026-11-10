@@ -118,7 +118,7 @@ Google 对部分账户强制设备绑定会话：OAuthMultilogin 响应的 `devi
 
 OAuthMultilogin 以该 Profile 的 Chrome 身份发出，请求头与 Chrome `GaiaAuthFetcher` 相同：HTTP/2 下依次为 `content-length`、`authorization`、`content-type`、`sec-fetch-site: none`、`sec-fetch-mode: no-cors`、`sec-fetch-dest: empty`、`user-agent`、`accept-encoding: gzip, deflate, br, zstd`、`accept-language` 与 `priority: u=4, i`。`user-agent` 的主版本取 User Data 的 `Last Version`；`accept-language` 取 Profile `Preferences` 的 `intl.accept_languages`，没有该项时取 `intl.selected_languages`，按 Chromium 的规则在带地区的语言后补主语言并依次加 `q=0.9` 到 `q=0.1`。导入与续签都读取账户导入来源的 User Data 目录中当前的 Chrome 版本与该 Profile 的语言设置，来源没有记录目录时读取稳定版 Chrome 的默认目录。
 
-Chrome 导入状态在 `storage-state.json` 的 `aistudio2api` 扩展中保存来源（浏览器、User Data 目录、Profile 与邮箱）、Gaia ID、refresh token、wrapped binding key 与 DBSC 会话登记。登录页跳转、签名 Cookie 失效、HTTP `401` 与协议 Code 16 进入同一认证恢复流程，覆盖 Worker 预热、按需启动、普通 RPC、受保护 RPC 与 Live 建连。服务优先在同一账户出口续签 Cookie；保存的 OAuth 材料被拒绝时，从当前 Chrome 匹配原账户邮箱与 Gaia ID，更新来源材料。没有 `aistudio2api` 扩展的账户在本机 Chrome 登录着同一邮箱时，从 Chrome 导入该邮箱的材料并写入扩展，此后按 Chrome 导入账户续签。有效 Cookie 提交后使动态头失效、关闭该账户 WAA runtime，并重放一次。恢复失败后，服务以账户的指纹、出口与保存的 Cookie 打开 AI Studio 新对话页：被转到 Google 登录页时账户标为 `auth_required`，管理事件同步发布账户状态，后续调度使用其他合格账户；页面正常打开时账户状态不变，只有该次请求失败或换号。
+Chrome 导入状态在 `storage-state.json` 的 `aistudio2api` 扩展中保存来源（浏览器、User Data 目录、Profile 与邮箱）、Gaia ID、refresh token、wrapped binding key 与 DBSC 会话登记。登录页跳转、签名 Cookie 失效、HTTP `401` 与协议 Code 16 进入同一认证恢复流程，覆盖 Worker 预热、按需启动、普通 RPC、受保护 RPC 与 Live 建连。服务优先在同一账户出口续签 Cookie；保存的 OAuth 材料被拒绝时，从当前 Chrome 匹配原账户邮箱与 Gaia ID，更新来源材料。没有 OAuth 材料的账户（Cookie 导入、外部 storage state 与隔离 Camoufox 登录的账户）在本机 Chrome 登录着同一邮箱时，从 Chrome 导入该邮箱的材料并写入扩展，此后按 Chrome 导入账户续签；在账户页重新登录时沿用账户已保存的 OAuth 材料。有效 Cookie 提交后使动态头失效、关闭该账户 WAA runtime，并重放一次。恢复失败后，服务以账户的指纹、出口与保存的 Cookie 打开 AI Studio 新对话页：被转到 Google 登录页时账户标为 `auth_required`，管理事件同步发布账户状态，后续调度使用其他合格账户；页面正常打开时账户状态不变，只有该次请求失败或换号。
 
 认证恢复等待同账户的正常请求结束；并发失效复用一次提交结果。替换登录材料推进认证代际，旧请求的认证结果按代际和请求顺序写回；生成正常结束后确认认证有效。HTTP `403`、协议 Code 7 与 Drive `unauthorized_client` 保留模型权限或 Drive 授权含义。隔离 Camoufox 登录和外部 storage state 在本机 Chrome 没有同一邮箱时只使用各自的登录材料。
 
@@ -1306,8 +1306,8 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 
 - `POST /api/pairing/accounts` 的令牌无效或过期时返回 401 `pairing_token_invalid`，账户已存在时返回 409 `account_exists`
 - `PUT /api/pairing/accounts/{account}/cookies` 的续签凭据与该账户不符时返回 401 `pairing_renewal_invalid`，账户不存在时返回 404 `account_not_found`，Cookie 无法生成 SAPISID 授权时返回 400 `invalid_account`
-- 一份 Cookie 可包含同一浏览器中多个 Google 账户的会话，第 N 个会话对应官网 `/u/N/` 与请求头 `X-Goog-AuthUser: N`。`POST /api/accounts/import/cookies/discover` 从 u/0 起依次打开各会话的对话页，列出每个会话登录的账户；`GET /api/accounts/import/browsers` 为每个浏览器的每个会话各列一项。`POST /api/accounts/import/cookies` 中每项的 `auth_user` 选择导入的会话，省略时为 0；账户的 `auth_user` 写入 `account.json`，运行时以 `/u/N/` 页面与 `X-Goog-AuthUser: N` 访问官网，浏览器重新登录后为 0
-- 添加、导入与重新登录账户在账户任务中运行：请求解析 body 后返回 202 与任务，任务不随请求或管理页面关闭而结束；任务中的账户依次处理，单个账户失败时在该项记下错误码与原因后继续下一个，Cookie 无法解析或缺少登录 Cookie 为 `invalid_cookies`，调试地址连接或读取失败为 `cdp_unavailable`，账户已存在为 `account_exists`；有账户失败时任务以 `failed` 结束，否则为 `done`。结束的任务保留到 `DELETE /api/accounts/tasks/{id}` 关闭，对进行中的任务调用它会取消任务，任务不存在时返回 404 `task_not_found`；任务列表变化时 `GET /api/events` 推送 `account_tasks` 事件，连接建立时先推送当前列表
+- 一份 Cookie 可包含同一浏览器中多个 Google 账户的会话，第 N 个会话对应官网 `/u/N/` 与请求头 `X-Goog-AuthUser: N`。`POST /api/accounts/import/cookies/discover` 从 u/0 起依次打开各会话的对话页，列出每个会话登录的账户；`GET /api/accounts/import/browsers` 为每个浏览器的每个会话各列一项，查询参数 `proxy` 为识别账户的请求出口，省略时用默认出口。`POST /api/accounts/import/cookies` 中每项的 `auth_user` 选择导入的会话，省略时为 0；账户的 `auth_user` 写入 `account.json`，运行时以 `/u/N/` 页面与 `X-Goog-AuthUser: N` 访问官网，浏览器重新登录后为 0
+- 添加、导入与重新登录账户在账户任务中运行：请求解析 body 后返回 202 与任务，任务不随请求或管理页面关闭而结束；任务中的账户依次处理，单个账户失败时在该项记下错误码与原因后继续下一个，Cookie 无法解析或缺少登录 Cookie 为 `invalid_cookies`，调试地址连接或读取失败为 `cdp_unavailable`；导入或浏览器登录得到账户列表中已有的账户时就地替换它的认证状态，保留文件资源绑定，账户目录已存在而账户不在列表中时为 `account_exists`；有账户失败时任务以 `failed` 结束，否则为 `done`。结束的任务保留到 `DELETE /api/accounts/tasks/{id}` 关闭，对进行中的任务调用它会取消任务，任务不存在时返回 404 `task_not_found`；任务列表变化时 `GET /api/events` 推送 `account_tasks` 事件，连接建立时先推送当前列表
 - `GET /api/pairing` 返回仍在有效期内的配对令牌，没有时返回 404 `pairing_token_missing`；`POST /api/pairing` 签发新令牌，此前的令牌随之失效
 - `GET /api/requests/{id}/body` 在没有保存正文时返回 404 `request_body_not_found`
 - `POST /api/accounts` 与 `POST /api/accounts/{id}/login` 的 body 可带 `view`，即管理页面为本次登录生成的登录窗口 ID；`POST /api/accounts/{id}/login` 也接受空 body。服务器没有图形界面，或请求来自非回环地址、带 `Forwarded` 或 `X-Forwarded-For` 时，登录画面经同一 ID 的 `GET /api/login-view/{view}` 传递，任务的 `view` 为该 ID；登录窗口断开后以同一 ID 重新连接，继续显示当前画面
@@ -1518,7 +1518,7 @@ Worker 进程故障、Worker 被替换与协议 Code 5 会重建当前账户 Wor
 
 模型目录重试的 pending 集合保存等待再次同步的账户 ID。启动期全账户同步、以及新增、登录或在管理端启用后的单账户同步，遇到任意错误或成功返回空目录时加入；返回非空目录时移除；删除账户同时移除。全账户后台同步结束后启动单个 30 秒 ticker（Go 定时器），每次按启动期同步的方式重新载入排序后的待重试账户的会话页面，并在任务开始时复核该 ID 仍在 pending 集合中。错误或空目录继续保留；每个非空成功立即更新账户缓存与公共目录快照、发布 `accounts` 和 `models`，并在 `RUNNING` 状态触发 Worker 预热。批次结束时，`auth_required` 集合发生变化会补发当前账户与模型快照；即时单账户同步无论成功或失败都立即发布当前快照。启动期同步、单账户同步与 30 秒重试中的每个账户读取占用该账户的一个普通并发槽位，与生成请求和 Worker 启动共用 `PER_ACCOUNT_CONCURRENCY`。
 
-同一循环从全账户同步开始时起每 24 小时巡检一轮：逐个重新载入全部 enabled 且处于 `ready` 或 `busy` 的账户的会话页面，读取页面载入时的 `GetAiStudioBenefitTier` 与 `ListModels` 响应（启用 Build 时另读 Build 目录；账户本进程的首次读取先按[条款同意](#条款同意)处理 `GetLoggingContext`）：
+同一循环从全账户同步开始时起每 24 小时巡检一轮：按权益从高到低（Ultra、Pro、Plus、Free）、同权益按账户 ID 的顺序，逐个重新载入全部 enabled 且处于 `ready` 或 `busy` 的账户的会话页面，读取页面载入时的 `GetAiStudioBenefitTier` 与 `ListModels` 响应（启用 Build 时另读 Build 目录；账户本进程的首次读取先按[条款同意](#条款同意)处理 `GetLoggingContext`）：
 
 - 每个账户占用一个普通并发槽位，与生成请求共用 `PER_ACCOUNT_CONCURRENCY`，槽位已满的账户跳过本轮
 - 请求的模型不在任何账户的目录中时，巡检正在读取一轮的第一个账户则请求等它读完；没有进行中的一轮且距上一轮开始已超过 10 分钟时，巡检立即开始一轮，请求等这一轮读完第一个账户后再查找模型，仍没有时返回模型不存在，其余账户在后台继续读取；下一轮巡检从这一轮开始时计时
@@ -1631,6 +1631,8 @@ Gemini `GET /v1beta/models` 返回 `{"models":[...]}`，单模型路由直接返
 | `/v1/videos` | `prompt` 或 `input_reference` | 长任务对象，随后轮询并下载内容 |
 
 生成与计数请求需要系统提示或对话内容中的至少一项，只有系统提示时以它作为 user 轮发送。请求以 assistant 轮结尾时，`gemini-3.1-pro-preview`、`gemini-3.1-flash-lite`、`gemini-3-flash-preview`、`gemini-omni-1.1-flash`、`gemini-nano-banana-2.1` 与 `gemma-` 开头的模型原样以 model 轮结尾发送，由模型原生续写。其余模型（包括 `-latest` 别名与 `-build` 写代码助手）在 `CONTINUATION_REWRITE` 打开时改写末尾连续 assistant 轮：`CONTINUATION_PROMPT` 非空时，这些轮的正文与代码执行内容以 `<assistant_prefix>` 包裹，连同该提示词写入系统指令；为空时这段正文作为最后一轮 user 发送。改写后模型从前缀之后续写，响应只返回续写部分，末尾未回传结果的函数调用由模型重新生成。`CONTINUATION_REWRITE` 关闭时所有模型原样发送，Playground 以 400 `Requests ending with a model turn are not supported` 拒绝的模型返回该错误。各生成入口与计数接口按同一规则转换，`countTokens` 接受以 model 轮结尾的请求。
+
+生成、计数与 Live 的系统提示按同一规则改写后发送：行首以 `You are` 或 `You're` 开头、以 agent、assistant 或 AI 结尾并带归属声明（`created by`、`built on`、`based on` 等）的身份句替换为 `You are an AI Agent.`，以 `x-anthropic-billing-header:` 开头的行与含 `RFC 2119 keywords`（不区分大小写）的行整行删除，改写后为空的系统提示分段不发送。
 
 四套生成入口共享同一规范请求，输入映射如下：
 
@@ -1832,6 +1834,7 @@ Responses 的图片、视频与文件 Part 复用上述 data URL、file ID 与 Y
 | item | 映射 |
 | --- | --- |
 | system/developer message | 文本进入系统指令，图片与文件移到首个 user 轮 |
+| `agent_message` | user 轮，`content` 中 `input_text` 的 `text` 与 `encrypted_content` 的 `encrypted_content` 依次作为文本 |
 | `custom_tool_call` | 函数调用，参数为 `{"input":<INPUT>}` |
 | `local_shell_call` | `local_shell` 函数调用，参数为去掉 `type` 的 `action` |
 | `shell_call` | `shell` 函数调用，参数为 `action` |

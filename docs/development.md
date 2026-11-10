@@ -80,7 +80,7 @@ go run ./cmd/aistudio2api
 
 `setup` 写入本机时要求 `AISTUDIO_AUTH_STATES` 指向一个账户目录。
 
-加 `--remote` 时，Chrome 导入、隔离登录、文件导入与 Cookie 导入照常在本机完成，结果凭远程实例账户页“远程添加”生成的配对令牌逐个上传，隔离登录同时上传 Camoufox 指纹。远程账户使用远程实例的默认代理，`--proxy` 只用于本机导入与登录。上传的账户带 Chrome OAuth 材料时（本机 Chrome 导入，或带该材料的认证状态文件），上传完成后命令留在前台：立即并每 100 分钟以本机 Chrome 来源与 OAuth 材料签发新会话，经 `PUT /api/pairing/accounts/{account}/cookies` 凭上传响应的 `renewal_token` 替换远程账户的 Cookie，失败时 5 分钟后重试，每次一行日志；续签材料与凭据保存在本机 `runtime/remote-renewals.json`（权限 0600），`--remote <origin> --renew` 读取该 origin 的记录恢复续签。只含隔离登录、文件或 Cookie 导入的账户时上传后退出。
+加 `--remote` 时，Chrome 导入、隔离登录、文件导入与 Cookie 导入照常在本机完成，结果凭远程实例账户页“远程添加”生成的配对令牌逐个上传，隔离登录同时上传 Camoufox 指纹。远程账户使用远程实例的默认代理，`--proxy` 只用于本机导入与登录。上传的账户带 Chrome OAuth 材料时（本机 Chrome 导入，或带该材料的认证状态文件），上传完成后命令留在前台：立即并每 100 分钟以本机 Chrome 来源与 OAuth 材料签发新会话，经 `PUT /api/pairing/accounts/{account}/cookies` 凭上传响应的 `renewal_token` 替换远程账户的 Cookie，失败时 5 分钟后重试，重试时沿用尚未送达、签发不到 100 分钟的会话，远程返回 401 `pairing_renewal_invalid` 或 404 `account_not_found` 时停止该账户并从记录中删除，其他失败照常重试，每次一行日志；续签材料与凭据保存在本机 `runtime/remote-renewals.json`（权限 0600），`--remote <origin> --renew` 读取该 origin 的记录恢复续签。只含隔离登录、文件或 Cookie 导入的账户时上传后退出。
 
 - `--proxy` 会同时固定到新账户的初始化、WAA 与业务请求，接受 HTTP、HTTPS 或 SOCKS5 URL，代理认证写在 URL 的 `user:password@` 部分；未指定时导入与登录使用 `PROXY` 中的第一个代理，新账户不设账户代理
 - `--locale` 和 `--timezone` 设置账户环境；Chrome 导入未显式指定语言时读取 Profile 的首选语言
@@ -353,7 +353,7 @@ Worker 容量由热池目标、活动上限和单账户并发共同约束。活�
 
 `ModelAccessKey(scope, model)` 会移除 `models/` 前缀；空 scope 返回规范模型 ID，非空 scope 返回 `<scope>:<canonicalModelID>`。Bidi setup 使用 lease（账户租约）时间，会话内每个 qualifying turn（一次模型资格检查）分配严格递增的 attempt 时间，`turn_complete` 消费对应 attempt。普通流式生成在规范 `EventFinish` 到达时写 `verified`；此前的 text、reasoning、tool、usage 和首事件用于输出与性能统计，终态前断流、取消或错误保持原验证状态。
 
-模型目录取自账户会话页面载入时的 `GetAiStudioBenefitTier` 与 `ListModels` 响应：有常驻 Worker 的账户取它最近一次页面载入，没有的账户在 Worker 容量允许时启动 Worker，否则临时载入一个页面，取得响应后关闭。启动期同步对全部 enabled ready/busy 账户执行，还没有目录的账户同时读取，已有目录的账户逐个读取，每个账户占用一个普通并发槽位。同步报错或返回空目录的账户进入 generation 内的 pending ID 集合；每个非空结果立即更新公共目录、账户状态并在 RUNNING 期间预热更多 Worker。启动期同步结束后，单个 30 秒 ticker（定时器）重新载入可用的 pending 账户的页面；同一循环从启动期同步开始时起每 24 小时逐个重新载入全部 enabled ready/busy 账户的页面，槽位已满的账户跳过本轮，权益或目录变化时写回并发布账户与模型快照。请求的模型不在任何账户的目录中时，巡检正在读取一轮的第一个账户则请求等它读完，没有进行中的一轮且距上一轮开始已超过 10 分钟时巡检立即开始一轮，请求等这一轮读完第一个账户后再查找模型，其余账户在后台继续读取。冷却中的任务保留到期再试；需要登录、停用、不可用或已删除的账户退出重试，重新登录或启用后由账户更新流程重新同步。失败日志记录账户与原因，恢复成功记录模型数量。`modelRevision` 跟踪账户和配置变化，生成服务开始接收请求前会确认已应用当前 revision。
+模型目录取自账户会话页面载入时的 `GetAiStudioBenefitTier` 与 `ListModels` 响应：有常驻 Worker 的账户取它最近一次页面载入，没有的账户在 Worker 容量允许时启动 Worker，否则临时载入一个页面，取得响应后关闭。启动期同步对全部 enabled ready/busy 账户执行，还没有目录的账户同时读取，已有目录的账户按权益从高到低、同权益按账户 ID 逐个读取，每个账户占用一个普通并发槽位。同步报错或返回空目录的账户进入 generation 内的 pending ID 集合；每个非空结果立即更新公共目录、账户状态并在 RUNNING 期间预热更多 Worker。启动期同步结束后，单个 30 秒 ticker（定时器）重新载入可用的 pending 账户的页面；同一循环从启动期同步开始时起每 24 小时按同样的顺序逐个重新载入全部 enabled ready/busy 账户的页面，槽位已满的账户跳过本轮，权益或目录变化时写回并发布账户与模型快照。请求的模型不在任何账户的目录中时，巡检正在读取一轮的第一个账户则请求等它读完，没有进行中的一轮且距上一轮开始已超过 10 分钟时巡检立即开始一轮，请求等这一轮读完第一个账户后再查找模型，其余账户在后台继续读取。冷却中的任务保留到期再试；需要登录、停用、不可用或已删除的账户退出重试，重新登录或启用后由账户更新流程重新同步。失败日志记录账户与原因，恢复成功记录模型数量。`modelRevision` 跟踪账户和配置变化，生成服务开始接收请求前会确认已应用当前 revision。
 
 认证状态包含长期凭证和设备绑定材料，保存在本机受控目录。提交、Issue、CI 和普通日志使用脱敏材料，保留字段形状并替换 Cookie、token、proof、邮箱、账户 ID、提示词、响应正文和完整原始帧。
 

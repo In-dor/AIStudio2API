@@ -23,6 +23,20 @@ export async function listDriveFiles(): Promise<DriveFile[]> {
   return ((await response.json()) as { files?: DriveFile[] }).files ?? []
 }
 
+// driveFileExists 检查已上传的 Files API 文件是否存在，signal 中止时请求随之中止
+export async function driveFileExists(
+  fileUri: string,
+  signal: AbortSignal | null = null,
+): Promise<boolean> {
+  const name = fileUri.split('/files/')[1]
+  if (!name) return false
+  const response = await fetch(`/v1beta/files/${encodeURIComponent(name)}`, {
+    headers: filesHeaders(),
+    signal,
+  })
+  return response.status !== 404
+}
+
 // filesHeaders 返回调用本服务 Files API 的请求头，设置了 API 密钥时带上密钥
 function filesHeaders(): Headers {
   const headers = new Headers()
@@ -31,8 +45,12 @@ function filesHeaders(): Headers {
   return headers
 }
 
-// uploadDriveFile 与官网一致在附件加入时经本服务 Files API 把文件上传到账户的 Drive，返回上传后的文件
-export async function uploadDriveFile(file: Blob, name: string): Promise<DriveFile> {
+// uploadDriveFile 与官网一致在附件加入时经本服务 Files API 把文件上传到账户的 Drive，返回上传后的文件；signal 中止时上传随之中止
+export async function uploadDriveFile(
+  file: Blob,
+  name: string,
+  signal: AbortSignal | null = null,
+): Promise<DriveFile> {
   const form = new FormData()
   form.append('metadata', JSON.stringify({ file: { displayName: name } }))
   form.append('file', file, name)
@@ -40,6 +58,7 @@ export async function uploadDriveFile(file: Blob, name: string): Promise<DriveFi
     method: 'POST',
     headers: filesHeaders(),
     body: form,
+    signal,
   })
   if (!response.ok) throw new Error(await response.text())
   return ((await response.json()) as { file: DriveFile }).file
