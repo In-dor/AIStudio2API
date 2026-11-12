@@ -30,6 +30,8 @@ type PooledService struct {
 	ignoreThoughtSigMu     sync.RWMutex
 	// YouTubeLinks 把 user 文本中的 YouTube 链接作为视频外部媒体发送
 	YouTubeLinks bool
+	// DiscoverHiddenModels 让同步账户目录时探测官网前端已配置、ListModels 尚未列出的模型
+	DiscoverHiddenModels bool
 	// StripThoughtSignatures 发送前去掉对话历史中的思考签名
 	StripThoughtSignatures bool
 	// ContinuationRewrite 改写不接受以 model 轮结尾请求的模型的末尾 assistant 轮
@@ -94,9 +96,9 @@ func NewPooledService(pool *AccountPool, client *Client) *PooledService {
 		client.setModelCatalog(accountID, catalog)
 	}
 	return &PooledService{
-		pool:        pool,
-		client:      client,
-		prewarming:  make(map[string]struct{}),
+		pool:       pool,
+		client:     client,
+		prewarming: make(map[string]struct{}),
 	}
 }
 
@@ -112,7 +114,7 @@ func NewWorkerProtectedTransport(options WorkerProtectedTransportOptions) *Worke
 	}
 }
 
-// DoProtected 写入 fresh proof 后经账户的 WAA 运行时发送 GenerateContent、Build 代理或写代码助手请求，写入页面输入框的提示词为最后一个轮次的文本；账户页面再次运行同一对话的 GenerateContent 按官网 Rerun 不写入提示词
+// DoProtected 写入 fresh proof 后经账户的 WAA 运行时发送 GenerateContent 或 Build 代理请求，写入页面输入框的提示词为最后一个轮次的文本；账户页面再次运行同一对话的 GenerateContent 按官网 Rerun 不写入提示词
 func (t *WorkerProtectedTransport) DoProtected(ctx context.Context, request GenerateRequest, rpc RPCRequest) (*RPCResponse, error) {
 	var prompt string
 	var promptHash string
@@ -122,9 +124,6 @@ func (t *WorkerProtectedTransport) DoProtected(ctx context.Context, request Gene
 	case buildProxyStreamedMethod, buildProxyUnaryMethod:
 		prompt, err = buildBindingPrompt(rpc.Body)
 		proofField = buildProofField
-	case assistantOfflineMethod:
-		promptHash, err = bindingPromptHash(request)
-		proofField = assistantProofField
 	default:
 		promptHash, err = bindingPromptHash(request)
 	}
@@ -639,6 +638,16 @@ func (s *PooledService) modelsForLease(ctx context.Context, lease *AccountLease,
 	if err != nil {
 		return nil, s.catalogFailure(leaseCtx, lease, err)
 	}
+	var hidden map[string]string
+	if s.DiscoverHiddenModels {
+		if hidden, err = s.client.DiscoverHiddenModels(leaseCtx, account.ID); err != nil {
+			slog.Warn("探测官网隐藏模型失败", "account", account.ID, "error", err)
+		}
+		models = s.client.accountModels(account.ID)
+	}
+	if err := s.pool.SetHiddenModels(account.ID, hidden, s.DiscoverHiddenModels && err == nil); err != nil {
+		return nil, err
+	}
 	buildEnabled := s.pool.BuildEnabled()
 	var buildModels []Model
 	var buildErr error
@@ -670,10 +679,13 @@ func (s *PooledService) modelsForLease(ctx context.Context, lease *AccountLease,
 	return models, nil
 }
 
-// catalogFailure 认证失败时确认账户会话并把已失效的账户标为需要登录，其余失败记为该账户最近一次目录读取错误
+// catalogFailure 认证失败时确认账户会话并把已失效的账户标为需要登录，Google 拒绝该账户时标为服务受限，其余失败记为该账户最近一次目录读取错误
 func (s *PooledService) catalogFailure(ctx context.Context, lease *AccountLease, err error) error {
 	if DefinitiveAuthenticationFailure(err) {
 		return errors.Join(err, lease.ConfirmAuthenticationFailure(ctx, err))
+	}
+	if denial := RestrictionDenial(err); denial != nil {
+		return errors.Join(err, s.pool.MarkRestricted(lease.Account().ID, denial))
 	}
 	s.pool.recordCatalogFailure(lease.Account().ID, err)
 	return err

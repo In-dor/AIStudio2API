@@ -71,7 +71,7 @@ func TestSanitizeThoughtSignatures(t *testing.T) {
 	}
 }
 
-func TestSanitizeThoughtSignaturesPreservesExternalMediaAndUpload(t *testing.T) {
+func TestSanitizeThoughtSignaturesPreservesExternalMediaAndFile(t *testing.T) {
 	contents := []Content{
 		{
 			Role: RoleUser,
@@ -81,8 +81,8 @@ func TestSanitizeThoughtSignaturesPreservesExternalMediaAndUpload(t *testing.T) 
 					ThoughtSignature: "sig-media",
 				},
 				{
-					Upload:           &UploadRef{MIME: "application/pdf", Path: "/upload/1", Name: "doc.pdf", Size: 123},
-					ThoughtSignature: "sig-upload",
+					File:             &FileRef{ID: "file-1", Name: "doc.pdf", MIME: "application/pdf"},
+					ThoughtSignature: "sig-file",
 				},
 				{
 					ToolCall:         &ServerToolStep{ID: "srv_1", Type: "GOOGLE_SEARCH_WEB", Name: "web_search"},
@@ -103,8 +103,8 @@ func TestSanitizeThoughtSignaturesPreservesExternalMediaAndUpload(t *testing.T) 
 	if cleaned[0].Parts[0].ExternalMedia == nil || cleaned[0].Parts[0].ThoughtSignature != "" {
 		t.Errorf("external media part corrupted: %+v", cleaned[0].Parts[0])
 	}
-	if cleaned[0].Parts[1].Upload == nil || cleaned[0].Parts[1].ThoughtSignature != "" {
-		t.Errorf("upload part corrupted: %+v", cleaned[0].Parts[1])
+	if cleaned[0].Parts[1].File == nil || cleaned[0].Parts[1].ThoughtSignature != "" {
+		t.Errorf("file part corrupted: %+v", cleaned[0].Parts[1])
 	}
 	if cleaned[0].Parts[2].ToolCall == nil || cleaned[0].Parts[2].ThoughtSignature != "" {
 		t.Errorf("server tool call part corrupted: %+v", cleaned[0].Parts[2])
@@ -119,4 +119,3 @@ func TestSanitizeThoughtSignaturesPreservesExternalMediaAndUpload(t *testing.T) 
 		t.Errorf("expected fast-path to return original slice without reallocation")
 	}
 }
-
