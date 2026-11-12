@@ -32,7 +32,7 @@ import (
 )
 
 // releaseAPI 为 GitHub 最新发行版本接口
-const releaseAPI = "https://api.github.com/repos/Mag1cFall/AIStudio2API/releases/latest"
+const releaseAPI = "https://api.github.com/repos/In-dor/AIStudio2API/releases/latest"
 
 // releaseCheckInterval 为最新发行版本的缓存时长
 const releaseCheckInterval = time.Hour
