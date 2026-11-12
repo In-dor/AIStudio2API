@@ -313,7 +313,7 @@ POST /api/control/start
 
 `runtime-state.json` 的 `model_access` value 为 `{state,checked_at,reason?}`，成功状态为 `verified`；`cooldowns` value 为 `{until,reason?}`；`resources` value 保存 kind、name、mime、size、purpose、created_at 与可选 video 元数据。Drive file、视频任务、视频产物和 Bidi 恢复 token 均保持创建账户粘性。视频任务额外保存公开 video object 的 model、seconds、size 与 UTC 创建时间，生成服务或进程重启后的轮询继续投影相同字段。
 
-活动请求锁保护跨进程账户租约，短事务锁保护 `runtime-state.json` 合并写回。短事务锁位于 `auth/.leases/<账户>.runtime.lock`，以 25ms 间隔等待，最多 2 秒；取得锁后重读磁盘状态，只修改目标字段，原子替换文件，再同步内存与资源索引。取租约时同样在锁内读取所选账户的文件，内容与上次同步或写入时相同则沿用内存状态。接收 context 的资源事务会在取消或 deadline 到达时提前返回。
+活动请求锁保护跨进程账户租约，短事务锁保护 `runtime-state.json` 合并写回。短事务锁位于 `auth/.leases/<账户>.runtime.lock`，以 25ms 间隔等到锁释放；取得锁后重读磁盘状态，只修改目标字段，原子替换文件，再同步内存与资源索引。取租约时同样在锁内读取所选账户的文件，内容与上次同步或写入时相同则沿用内存状态。接收 context 的资源事务会在取消或 deadline 到达时提前返回。
 
 账户更新以 `account.json` 原子写入为持久提交点。`internal/app` 先准备 `pending`（尚未提交）的固定出口，关闭旧 Worker并锁定该账户的 Worker 配置，再调用 `AccountLease.SaveConfig`；保存成功后依次提交 Worker 配置与固定出口。准备、关闭或保存失败时丢弃 pending 更新；保存后的租约释放错误原样返回，已发布配置继续生效。
 
@@ -325,7 +325,7 @@ Worker 容量由热池目标、活动上限和单账户并发共同约束。活�
 
 故障重置先等待同账户的活动请求释放租约；等待期间该账户暂停接收新请求。客户端取消只结束自身请求。启动预热在官网 Run 按钮启用后提交，请求在发送前再次检查账户冷却状态。
 
-额度冷却按 `quota_unit`、`quota_limit`、`quota_metric`、错误文案依次判定周期。明确的每日限额在美国太平洋时间次日零点恢复；分钟限额按有效的 `window_start_time` 恢复；通用 429 冷却一分钟。写明恢复时间的套餐限额（`You've reached your usage limit for this model (resets in 10 hours, 2 minutes)`）冷却到该时间；没有重试时间的套餐限额（`You've reached your usage limit` 或 Build 写代码助手步骤带每用户额度标记）按同一账户同一 scope 的连续次数冷却 1、5、15、30、60 分钟，冷却未结束时的并发失败沿用当前期限，该 scope 成功一次后从 1 分钟重新开始；订阅模型遇到额度错误时，后台立即刷新该账户的权益与目录，同一账户每分钟最多一次。`RetryInfo` 与 `Retry-After` 提供的重试时间优先。错误列出的额度项上限全部为 0（`limit: 0`）时冷却类型为无配额，期限同样按上述规则。全局范围由额度元数据确认，其余错误只冷却失败模型或能力 scope；正文后的额度错误与 Live 会话错误使用同一规则。全部候选账户都在冷却且最早恢复晚于 1 分钟时，套餐限额与每日限额冷却中的账户仍接收请求：上游按每个请求判定是否放行，用尽后较短的请求仍可能完成；同一请求再收到这两种限额拒绝时按上游原因冷却并返回该 429，不再换账户。
+额度冷却按 `quota_unit`、`quota_limit`、`quota_metric`、错误文案依次判定周期。明确的每日限额在美国太平洋时间次日零点恢复；分钟限额按有效的 `window_start_time` 恢复；通用 429 冷却一分钟。写明恢复时间的套餐限额（`You've reached your usage limit for this model (resets in 10 hours, 2 minutes)`）冷却到该时间；没有重试时间的套餐限额（`You've reached your usage limit` 或 Build 写代码助手步骤带每用户额度标记）按同一账户同一 scope 的连续次数冷却 1、5、15、30、60 分钟，冷却未结束时的并发失败沿用当前期限，该 scope 成功一次后从 1 分钟重新开始；订阅模型遇到额度错误时，后台立即刷新该账户的权益与目录，同一账户每分钟最多一次。`RetryInfo` 与 `Retry-After` 提供的重试时间优先。错误列出的额度项上限全部为 0（`limit: 0`）时冷却类型为无配额，期限同样按上述规则。全局范围由额度元数据确认，其余错误只冷却失败模型或能力 scope；正文后的额度错误与 Live 会话错误使用同一规则。全部候选账户都在冷却且最早恢复晚于 1 分钟时，套餐限额与每日限额冷却中的账户仍接收请求：上游按每个请求判定是否放行，用尽后较短的请求仍可能完成；同一请求依次发往这些账户、每个账户一次，上游放行即完成，被拒的账户按上游原因更新冷却，全部拒绝时返回最后一次的 429。
 
 账户状态：
 
@@ -475,6 +475,8 @@ CGO_ENABLED=1 go build -trimpath -tags desktop,production -o aistudio2api ./cmd/
 Linux 的主窗口与托盘菜单把 WebKitGTK 的硬件加速策略设为 `WebviewGpuPolicyNever`，页面由 CPU 绘制，不经 GL 合成。
 
 Windows 桌面版启动时经 Wails 查询 WebView2 运行时版本。查不到且以显示窗口方式启动时，用消息框询问是否安装，询问的同时在后台下载微软 Evergreen 引导程序：确定后等下载完成，后台下载失败时重新下载一次，以 `/install` 按当前用户权限安装，下载与安装进度显示在引导程序自己的窗口中，完成后创建桌面窗口；取消询问时删除已下载的引导程序。在引导程序窗口中取消安装与取消询问相同，安装失败时先以消息框说明。取消、安装失败或以隐藏方式启动时只创建托盘：服务就绪后在默认浏览器打开管理页面，双击托盘图标或再次运行可执行文件也打开管理页面。
+
+Windows 桌面版的 WebView2 数据写入 `%LocalAppData%\AIStudio2API\WebView2`。
 
 主窗口在显示时创建，关闭时连同 WebView 一起销毁，进程只保留托盘；再次运行或从托盘显示窗口时，以上次关闭前的位置、大小与最大化状态重新创建，并直接打开关闭前所在的管理页面路由。页面经 `busy:1`、`busy:0` 消息告知桌面壳是否需要保留：有进行中的生成或管理写请求、待写入或写入失败的对话、未发送的对话输入、未保存的设置，或只存在于页面的生成图片与音频时，关闭窗口只隐藏窗口，页面报告空闲后再销毁，在此之前从托盘显示窗口取回原页面。托盘菜单在页面加载前按系统语言显示，页面加载后跟随界面语言。
 

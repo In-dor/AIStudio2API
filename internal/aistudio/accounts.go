@@ -40,7 +40,6 @@ const (
 	globalCooldownKey = "*"
 	externalLeasePoll = 100 * time.Millisecond
 	runtimeLockPoll   = 25 * time.Millisecond
-	runtimeLockLimit  = 2 * time.Second
 )
 
 // AccountState 表示账户当前是否可调度
@@ -2852,13 +2851,13 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 			if account.ID == accountID {
 				if allowed != nil {
 					if _, exists := allowed[accountID]; !exists {
-						return nil, ErrNoEligibleAccount
+						return nil, fmt.Errorf("%w：账户 %s 不在本次请求可用的账户中", ErrNoEligibleAccount, accountID)
 					}
 				}
 				return []int{index}, nil
 			}
 		}
-		return nil, ErrNoEligibleAccount
+		return nil, fmt.Errorf("%w：账户 %s 不存在", ErrNoEligibleAccount, accountID)
 	}
 	indices := make([]int, 0, len(p.accounts))
 	for index, account := range p.accounts {
@@ -3471,9 +3470,7 @@ func lockRuntimeState(ctx context.Context, account *Account) (*flock.Flock, erro
 		return nil, fmt.Errorf("创建账户状态锁目录: %w", err)
 	}
 	lock := flock.New(filepath.Join(leaseDirectory, filepath.Base(account.Directory)+".runtime.lock"))
-	lockCtx, cancel := context.WithTimeout(ctx, runtimeLockLimit)
-	defer cancel()
-	_, err := lock.TryLockContext(lockCtx, runtimeLockPoll)
+	_, err := lock.TryLockContext(ctx, runtimeLockPoll)
 	if err != nil {
 		return nil, fmt.Errorf("锁定账户运行状态: %w", err)
 	}

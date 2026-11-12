@@ -70,10 +70,16 @@ const (
 	assistantLatestPrompt = "Continue the conversation from the last turn of the conversation history at the end of your instructions."
 	// assistantEmptyReplyPrompt 是模型一轮结束时没有正文与函数调用后在同一应用中追加的用户轮
 	assistantEmptyReplyPrompt = "Your last turn ended without any visible reply. Continue now and give your reply."
+	// assistantCallFormat 是要求重写调用时附带的 function_calls 代码块格式与交回调用的说明
+	assistantCallFormat = assistantCallFence + "\n[{\"name\": \"<function name>\", \"arguments\": {<arguments>}}]\n```\nRight after the block, call your " + assistantQuestionTool + " tool once with the question \"" + assistantCallQuestion + "\" and write nothing more. Do not repeat any earlier text."
+	// assistantMalformedCallPrompt 是模型未写出 function_calls 代码块或代码块 JSON 无效时在同一应用中追加的用户轮
+	assistantMalformedCallPrompt = "Your last function_calls block was missing or contained invalid JSON. Output only a valid " + assistantCallFence + " fenced JSON block:\n" + assistantCallFormat
+	// assistantInvalidToolPrompt 是模型调用了被禁止的远程工作区内置工具而非客户端函数时在同一应用中追加的用户轮
+	assistantInvalidToolPrompt = "You called a forbidden remote workspace tool instead of a client function. Never call remote workspace tools. Output only a valid " + assistantCallFence + " fenced JSON block for the client function call(s):\n" + assistantCallFormat
 	// assistantInterruptedPrompt 是上游步骤在已输出正文后失败时在同一应用中追加的用户轮，%s 为已输出正文的末尾
 	assistantInterruptedPrompt = "Your last turn was cut off by an internal error. The user already received your reply up to the end of this text:\n<partial_reply>\n%s\n</partial_reply>\nContinue the reply right after it without repeating it."
-	// assistantPartialReplyRunes 是 assistantInterruptedPrompt 带上的已输出正文末尾的字符数上限
-	assistantPartialReplyRunes = 20000
+	// assistantPartialReplyPrompt 是模型已输出部分正文后需要续出或修正工具调用时附带的已输出正文末尾，%s 为已输出正文的末尾
+	assistantPartialReplyPrompt = "\n\nThe user already received your reply up to the end of this text:\n<partial_reply>\n%s\n</partial_reply>\nDo not repeat it."
 )
 
 // assistantWorkspaceTools 是写代码助手服务端指令声明的工作区内置工具，search_web 在最后
@@ -421,7 +427,10 @@ func (c *Client) sendAssistant(ctx context.Context, request GenerateRequest, ent
 		var answer strings.Builder
 		var reply []Part
 		var usage *Usage
-		collect := func(event Event) error {
+		var finish *Event
+		// stripper 去掉追加任务开头重复已输出正文的前缀
+		var stripper *continuationPrefixStripper
+		record := func(event Event) error {
 			switch event.Kind {
 			case EventText:
 				answer.WriteString(event.Text)
@@ -434,8 +443,15 @@ func (c *Client) sendAssistant(ctx context.Context, request GenerateRequest, ent
 					event.Usage = &merged
 				}
 				usage = event.Usage
+			case EventFinish:
+				value := event
+				finish = &value
+				return nil
 			}
 			return emit(event)
+		}
+		collect := func(event Event) error {
+			return stripper.filter(event, record)
 		}
 		decoder := newDecoder(streamBody)
 		err := DecodeAssistantStream(source, decoder, collect)
@@ -447,7 +463,10 @@ func (c *Client) sendAssistant(ctx context.Context, request GenerateRequest, ent
 		for followed := 0; followed < regenerations; followed++ {
 			prompt := assistantEmptyReplyPrompt
 			var failure *RPCError
-			if err != nil {
+			if err != nil && decoder.unanswered && answer.Len() > 0 {
+				// 追加的任务没有任何模型回复即结束时以空回复提示再追加一轮
+				err = nil
+			} else if err != nil {
 				if !decoder.failed || answer.Len() == 0 || !errors.As(err, &failure) || failure.StatusCode != http.StatusBadGateway {
 					break
 				}
@@ -460,11 +479,26 @@ func (c *Client) sendAssistant(ctx context.Context, request GenerateRequest, ent
 				if err != nil {
 					break
 				}
-				partial := []rune(answer.String())
-				prompt = fmt.Sprintf(assistantInterruptedPrompt, string(partial[max(0, len(partial)-assistantPartialReplyRunes):]))
-			} else if len(reply) > replied || decoder.overran || decoder.malformed {
+				prompt = fmt.Sprintf(assistantInterruptedPrompt, partialReplyTail(answer.String()))
+			} else if !decoder.called && (decoder.malformed || decoder.invalidTool) {
+				if decoder.malformed {
+					prompt = assistantMalformedCallPrompt
+				} else {
+					prompt = assistantInvalidToolPrompt
+				}
+				if strings.TrimSpace(answer.String()) != "" {
+					prompt += fmt.Sprintf(assistantPartialReplyPrompt, partialReplyTail(answer.String()))
+				}
+			} else if len(reply) > replied || decoder.stopped {
 				break
 			}
+			// 任务在被禁止的工作区工具处截断时上游仍在运行，追加用户轮之前取消
+			if decoder.invalidTool {
+				if err = cleanup.cancel(ctx, *cleanup.generation.Load()); err != nil {
+					break
+				}
+			}
+			stripper = newContinuationPrefixStripper(answer.String())
 			replied = len(reply)
 			searches = append(searches, decoder.searches...)
 			followUp := request
@@ -477,14 +511,25 @@ func (c *Client) sendAssistant(ctx context.Context, request GenerateRequest, ent
 			}
 			err = errors.Join(DecodeAssistantStream(follow.Body, decoder, collect), follow.Body.Close())
 		}
-		cleanup.completed.Store(decoder.failed || err == nil && decoder.finished && !decoder.overran)
-		if err == nil && interruption != nil && len(reply) == replied {
+		cleanup.completed.Store(decoder.failed || err == nil && decoder.finished && !decoder.stopped)
+		if err == nil && interruption != nil && len(reply) == replied && !decoder.malformed && !decoder.invalidTool {
 			err = interruption
 		}
 		if err == nil {
 			assistantSearches.store(apiKey, historyDigest, answer.String(), append(searches, decoder.searches...))
-			if decoder.finished && !decoder.overran && !decoder.malformed && interruption == nil {
+			if decoder.finished && !decoder.stopped && !decoder.malformed && !decoder.invalidTool && interruption == nil {
 				cleanup.tip.Store(&assistantSessionKey{apiKey: apiKey, digest: assistantLinkDigest(links[len(links)-1].digest, true, reply)})
+			}
+			if !decoder.called && (decoder.malformed || decoder.invalidTool) {
+				if finish == nil {
+					finish = &Event{Kind: EventFinish}
+				}
+				finish.FinishReason = decodeFinishReason(10)
+			}
+			if finish != nil {
+				if emitErr := emit(*finish); emitErr != nil {
+					return emitErr
+				}
 			}
 		}
 		return err
@@ -684,6 +729,20 @@ type assistantCleanup struct {
 	once sync.Once
 }
 
+// cancel 取消应用中的任务 generation，任务已在上游结束时上游返回 FAILED_PRECONDITION，同样视为已停止
+func (cleanup *assistantCleanup) cancel(ctx context.Context, generation string) error {
+	body, _ := json.Marshal([]any{generation, cleanup.session.applet})
+	response, err := cleanup.client.do(ctx, "CancelCodeAssistantOfflineGeneration", cleanup.accountID, "", body, false)
+	if err == nil {
+		_, err = io.Copy(io.Discard, response.Body)
+		err = errors.Join(err, response.Body.Close())
+	}
+	if failure := (*RPCError)(nil); errors.As(err, &failure) && failure.Code == 9 {
+		return nil
+	}
+	return err
+}
+
 // run 执行一次清理：结束会话上的请求，未完成的任务在后台以独立期限取消
 func (cleanup *assistantCleanup) run() {
 	cleanup.once.Do(func() {
@@ -698,13 +757,7 @@ func (cleanup *assistantCleanup) run() {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), assistantCleanupTimeout)
 			defer cancel()
-			body, _ := json.Marshal([]any{*generation, cleanup.session.applet})
-			response, err := cleanup.client.do(ctx, "CancelCodeAssistantOfflineGeneration", cleanup.accountID, "", body, false)
-			if err == nil {
-				_, err = io.Copy(io.Discard, response.Body)
-				err = errors.Join(err, response.Body.Close())
-			}
-			if err != nil {
+			if err := cleanup.cancel(ctx, *generation); err != nil {
 				slog.Warn("Build 写代码助手清理失败", "account", cleanup.accountID, "method", "CancelCodeAssistantOfflineGeneration", "applet", cleanup.session.applet, "error", err)
 			}
 		}()
@@ -741,24 +794,27 @@ type AssistantStreamDecoder struct {
 	// block 表示 held 以调用候选代码块开头，other 表示正处在其他代码块内
 	block bool
 	other bool
-	// called 表示已输出函数调用，malformed 表示 function_calls 代码块无法解码
-	called    bool
-	malformed bool
-	lastStep  int64
-	wroteText bool
-	finished  bool
+	// called 表示已输出函数调用，malformed 表示 function_calls 代码块无法解码，invalidTool 表示声明了客户端函数时模型调用了被禁止的工作区内置工具
+	called      bool
+	malformed   bool
+	invalidTool bool
+	lastStep    int64
+	wroteText   bool
+	finished    bool
 	// answered 表示最近解码的步骤是已完成、含正文且没有工具动作的模型步骤，即本轮回复结束
 	answered bool
-	// overran 表示本轮回复在函数调用处结束：调用之后模型继续输出正文或上游后续步骤失败
-	overran bool
+	// stopped 表示不再读取本任务后续步骤：函数调用之后模型继续输出正文、上游后续步骤失败，或模型调用了被禁止的工作区工具、交回的提问缺少调用块
+	stopped bool
 	// failed 表示上游任务以失败步骤结束，不再需要取消
 	failed bool
+	// unanswered 表示任务流正常结束而本任务没有任何模型回复
+	unanswered bool
 }
 
 // DecodeAssistantStream 解码 StreamCodeAssistantOfflineGeneration 响应：field 1 为消息列表，其后可带 google.rpc 状态；本轮回复结束、函数调用之后模型继续输出正文或上游后续步骤失败时不再读取上游，消息列表在回复完成前正常结束时经 Reopen 重新打开一次任务流继续读取，仍未完成而已解出完整函数调用或写出正文时以已有内容结束本轮
 func DecodeAssistantStream(source io.Reader, decoder *AssistantStreamDecoder, emit func(Event) error) error {
 	err := decodeAssistantMessages(source, decoder, emit)
-	if err == nil && !decoder.finished && !decoder.overran && decoder.Reopen != nil {
+	if err == nil && !decoder.finished && !decoder.stopped && decoder.Reopen != nil {
 		var reopened io.ReadCloser
 		if reopened, err = decoder.Reopen(); err == nil {
 			err = errors.Join(decodeAssistantMessages(reopened, decoder, emit), reopened.Close())
@@ -797,7 +853,7 @@ func decodeAssistantMessages(source io.Reader, decoder *AssistantStreamDecoder, 
 	if token, err := stream.Token(); err != nil || token != json.Delim('[') {
 		return fail("$[0]", "消息列表不是数组")
 	}
-	for ; !decoder.answered && !decoder.overran && stream.More(); index++ {
+	for ; !decoder.answered && !decoder.stopped && stream.More(); index++ {
 		var raw json.RawMessage
 		if err := stream.Decode(&raw); err != nil {
 			return fail(fmt.Sprintf("$[0][%d]", index), err.Error())
@@ -812,7 +868,7 @@ func decodeAssistantMessages(source io.Reader, decoder *AssistantStreamDecoder, 
 			}
 		}
 	}
-	if !decoder.answered && !decoder.overran {
+	if !decoder.answered && !decoder.stopped {
 		if token, err := stream.Token(); err != nil || token != json.Delim(']') {
 			return fail("$[0]", "消息列表没有正常结束")
 		}
@@ -856,6 +912,9 @@ func (d *AssistantStreamDecoder) Decode(raw json.RawMessage, path string) ([]Eve
 			return nil, err
 		}
 		events = append(events, stepEvents...)
+		if d.stopped {
+			break
+		}
 	}
 	return events, nil
 }
@@ -884,7 +943,7 @@ func (d *AssistantStreamDecoder) decodeStep(raw json.RawMessage, path string, ev
 		}
 		d.failed = true
 		if d.called {
-			d.overran = true
+			d.stopped = true
 			return nil, nil
 		}
 		return nil, failed
@@ -897,54 +956,69 @@ func (d *AssistantStreamDecoder) decodeStep(raw json.RawMessage, path string, ev
 		d.usage[number] = usage
 	}
 	var events []Event
+	invalidAction := false
+	missingCallQuestion := false
 	if actionRaw := rawAt(step, 9); !isJSONNull(actionRaw) && status == 1 && !d.searched[number] {
-		if err := d.decodeSearch(actionRaw, path+"[9]", evidence); err != nil {
+		action, err := rawArray(actionRaw, path+"[9]", evidence)
+		if err != nil {
+			return nil, withMethod(err, assistantStreamMethod)
+		}
+		if err := d.decodeSearch(action, path+"[9]", evidence); err != nil {
 			return nil, err
 		}
-		if events, err = d.decodeQuestion(actionRaw, path+"[9]", evidence); err != nil {
+		var isQuestion bool
+		if events, isQuestion, err = d.decodeQuestion(action, path+"[9]", evidence); err != nil {
 			return nil, err
 		}
+		invalidAction = !isQuestion && isJSONNull(rawAt(action, 18)) && len(events) == 0
+		missingCallQuestion = isQuestion && len(events) == 0
 		d.searched[number] = true
 	}
 	contentsRaw := rawAt(step, 0)
-	if isJSONNull(contentsRaw) {
-		return events, nil
-	}
-	contents, err := rawArray(contentsRaw, path+"[0]", evidence)
-	if err != nil {
-		return nil, withMethod(err, assistantStreamMethod)
-	}
-	partOffset := 0
-	for contentIndex, contentRaw := range contents {
-		contentPath := fmt.Sprintf("%s[0][%d]", path, contentIndex)
-		content, err := rawArray(contentRaw, contentPath, evidence)
+	if !isJSONNull(contentsRaw) {
+		contents, err := rawArray(contentsRaw, path+"[0]", evidence)
 		if err != nil {
 			return nil, withMethod(err, assistantStreamMethod)
 		}
-		role, err := rawString(rawAt(content, 1), contentPath+"[1]", evidence)
-		if err != nil {
-			return nil, withMethod(err, assistantStreamMethod)
-		}
-		if role != "model" {
-			continue
-		}
-		parts, err := rawArray(rawAt(content, 0), contentPath+"[0]", evidence)
-		if err != nil {
-			return nil, withMethod(err, assistantStreamMethod)
-		}
-		for partIndex, partRaw := range parts {
-			partEvents, err := d.decodePart(number, partOffset+partIndex, partRaw, fmt.Sprintf("%s[0][%d]", contentPath, partIndex), evidence)
+		partOffset := 0
+		for contentIndex, contentRaw := range contents {
+			contentPath := fmt.Sprintf("%s[0][%d]", path, contentIndex)
+			content, err := rawArray(contentRaw, contentPath, evidence)
 			if err != nil {
-				return nil, err
+				return nil, withMethod(err, assistantStreamMethod)
 			}
-			events = append(events, partEvents...)
+			role, err := rawString(rawAt(content, 1), contentPath+"[1]", evidence)
+			if err != nil {
+				return nil, withMethod(err, assistantStreamMethod)
+			}
+			if role != "model" {
+				continue
+			}
+			parts, err := rawArray(rawAt(content, 0), contentPath+"[0]", evidence)
+			if err != nil {
+				return nil, withMethod(err, assistantStreamMethod)
+			}
+			for partIndex, partRaw := range parts {
+				partEvents, err := d.decodePart(number, partOffset+partIndex, partRaw, fmt.Sprintf("%s[0][%d]", contentPath, partIndex), evidence)
+				if err != nil {
+					return nil, err
+				}
+				events = append(events, partEvents...)
+			}
+			partOffset += len(parts)
+			if status == 1 {
+				d.finished = true
+			}
 		}
-		partOffset += len(parts)
-		if status == 1 {
-			d.finished = true
-		}
+		d.answered = status == 1 && isJSONNull(rawAt(step, 9)) && d.wroteText && d.lastStep == number
 	}
-	d.answered = status == 1 && isJSONNull(rawAt(step, 9)) && d.wroteText && d.lastStep == number
+	if invalidAction && len(d.Functions) > 0 && !d.called {
+		d.invalidTool = true
+		d.stopped = true
+	} else if missingCallQuestion && len(d.Functions) > 0 && !d.called && !d.block {
+		d.malformed = true
+		d.stopped = true
+	}
 	return events, nil
 }
 
@@ -1047,7 +1121,7 @@ func (d *AssistantStreamDecoder) text(delta string) []Event {
 		return []Event{{Kind: EventText, Text: delta}}
 	}
 	if d.called {
-		d.overran = d.overran || strings.TrimSpace(delta) != ""
+		d.stopped = d.stopped || strings.TrimSpace(delta) != ""
 		return nil
 	}
 	d.held += delta
@@ -1086,11 +1160,18 @@ func (d *AssistantStreamDecoder) text(delta string) []Event {
 			start := strings.Index(d.held, assistantFence)
 			if start < 0 {
 				keep := len(d.held) - len(strings.TrimRight(d.held, "`"))
-				emit(d.held[:len(d.held)-keep])
+				prefix := d.held[:len(d.held)-keep]
+				if d.malformed && strings.TrimSpace(prefix) == "" {
+					return events
+				}
+				emit(prefix)
 				d.held = d.held[len(d.held)-keep:]
 				return events
 			}
-			emit(d.held[:start])
+			prefix := d.held[:start]
+			if !d.malformed || strings.TrimSpace(prefix) != "" {
+				emit(prefix)
+			}
 			d.held = d.held[start:]
 			newline := strings.IndexByte(d.held, '\n')
 			if newline < 0 {
@@ -1105,7 +1186,7 @@ func (d *AssistantStreamDecoder) text(delta string) []Event {
 			d.other = true
 		}
 	}
-	d.overran = strings.TrimSpace(d.held) != ""
+	d.stopped = strings.TrimSpace(d.held) != ""
 	d.held = ""
 	return events
 }
@@ -1160,7 +1241,7 @@ func assistantCalls(body string, anyName bool, functions []string) ([]Event, boo
 	return events, true
 }
 
-// repairJSONStrings 修正 JSON 字符串中模型写出的内容：不合法的转义（如按 Python 写出的 \x27、Windows 路径中 \u 之后不是十六进制的部分）改为字面反斜杠，原始控制字符（如多行代码中的换行）改为转义
+// repairJSONStrings 修正 JSON 字符串中模型写出的内容并去掉 } 或 ] 之前的尾随逗号：不合法的转义（如按 Python 写出的 \x27、Windows 路径中 \u 之后不是十六进制的部分）写为字面反斜杠，原始控制字符（如多行代码中的换行）写为转义
 func repairJSONStrings(body string) string {
 	var repaired strings.Builder
 	quoted := false
@@ -1174,6 +1255,8 @@ func repairJSONStrings(body string) string {
 			repaired.WriteString(`\\`)
 		case quoted && char < 0x20:
 			fmt.Fprintf(&repaired, `\u%04x`, char)
+		case !quoted && char == ',' && nextNonSpaceCloses(body[index+1:]):
+			continue
 		default:
 			if char == '"' {
 				quoted = !quoted
@@ -1182,6 +1265,21 @@ func repairJSONStrings(body string) string {
 		}
 	}
 	return repaired.String()
+}
+
+// nextNonSpaceCloses 表示 rest 在跳过空白后紧跟 } 或 ]
+func nextNonSpaceCloses(rest string) bool {
+	for index := 0; index < len(rest); index++ {
+		switch rest[index] {
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '}', ']':
+			return true
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 // validJSONEscape 表示反斜杠之后的 rest 以 JSON 合法转义开头，\u 之后须为 4 位十六进制
@@ -1193,47 +1291,43 @@ func validJSONEscape(rest string) bool {
 }
 
 // decodeQuestion 解码 ask_question 工具动作 field 22 [标题, null, 说明, [[参数名, 值]...]]：没有输出函数调用时把各问题与选项输出为正文，交回函数调用的提问不输出
-func (d *AssistantStreamDecoder) decodeQuestion(raw json.RawMessage, path string, evidence json.RawMessage) ([]Event, error) {
-	action, err := rawArray(raw, path, evidence)
-	if err != nil {
-		return nil, withMethod(err, assistantStreamMethod)
-	}
+func (d *AssistantStreamDecoder) decodeQuestion(action []json.RawMessage, path string, evidence json.RawMessage) ([]Event, bool, error) {
 	toolRaw := rawAt(action, 21)
 	if isJSONNull(toolRaw) || d.called {
-		return nil, nil
+		return nil, false, nil
 	}
 	tool, err := rawArray(toolRaw, path+"[21]", evidence)
 	if err != nil {
-		return nil, withMethod(err, assistantStreamMethod)
+		return nil, false, withMethod(err, assistantStreamMethod)
 	}
 	pairs, err := rawArray(rawAt(tool, 3), path+"[21][3]", evidence)
 	if err != nil {
-		return nil, withMethod(err, assistantStreamMethod)
+		return nil, false, withMethod(err, assistantStreamMethod)
 	}
 	arguments := map[string]string{}
 	for index, pairRaw := range pairs {
 		pairPath := fmt.Sprintf("%s[21][3][%d]", path, index)
 		pair, err := rawArray(pairRaw, pairPath, evidence)
 		if err != nil {
-			return nil, withMethod(err, assistantStreamMethod)
+			return nil, false, withMethod(err, assistantStreamMethod)
 		}
 		name, err := rawString(rawAt(pair, 0), pairPath+"[0]", evidence)
 		if err != nil {
-			return nil, withMethod(err, assistantStreamMethod)
+			return nil, false, withMethod(err, assistantStreamMethod)
 		}
 		if arguments[name], err = rawString(rawAt(pair, 1), pairPath+"[1]", evidence); err != nil {
-			return nil, withMethod(err, assistantStreamMethod)
+			return nil, false, withMethod(err, assistantStreamMethod)
 		}
 	}
 	if arguments["tag"] != assistantQuestionTool {
-		return nil, nil
+		return nil, false, nil
 	}
 	var questions []struct {
 		Question string   `json:"question"`
 		Options  []string `json:"options"`
 	}
 	if err := json.Unmarshal([]byte(arguments["questions"]), &questions); err != nil {
-		return nil, &ProtocolEvidenceError{Method: assistantStreamMethod, Path: path + "[21][3]", Detail: "ask_question 的 questions 不是问题列表: " + err.Error(), Raw: cloneRaw(evidence)}
+		return nil, true, &ProtocolEvidenceError{Method: assistantStreamMethod, Path: path + "[21][3]", Detail: "ask_question 的 questions 不是问题列表: " + err.Error(), Raw: cloneRaw(evidence)}
 	}
 	var text strings.Builder
 	for _, question := range questions {
@@ -1249,18 +1343,14 @@ func (d *AssistantStreamDecoder) decodeQuestion(raw json.RawMessage, path string
 		}
 	}
 	if text.Len() == 0 {
-		return nil, nil
+		return nil, true, nil
 	}
 	d.wroteText = true
-	return []Event{{Kind: EventText, Text: text.String()}}, nil
+	return []Event{{Kind: EventText, Text: text.String()}}, true, nil
 }
 
 // decodeSearch 把完成的 search_web 工具动作（field 19：查询、域名、摘要、[标题, 链接] 列表）并入搜索来源，查询与摘要记入 searches
-func (d *AssistantStreamDecoder) decodeSearch(raw json.RawMessage, path string, evidence json.RawMessage) error {
-	action, err := rawArray(raw, path, evidence)
-	if err != nil {
-		return withMethod(err, assistantStreamMethod)
-	}
+func (d *AssistantStreamDecoder) decodeSearch(action []json.RawMessage, path string, evidence json.RawMessage) error {
 	searchRaw := rawAt(action, 18)
 	if isJSONNull(searchRaw) {
 		return nil
@@ -1330,19 +1420,20 @@ func (d *AssistantStreamDecoder) recorded() []Event {
 
 // End 在本轮回复结束、函数调用之后模型继续输出正文或流结束时返回扣下的正文或函数调用、搜索来源、各步骤用量之和与完成事件
 func (d *AssistantStreamDecoder) End() ([]Event, error) {
-	if !d.finished && !d.overran && !d.called && !d.wroteText {
+	if !d.finished && !d.stopped && !d.called && !d.wroteText {
+		d.unanswered = true
 		return nil, &ProtocolEvidenceError{Method: assistantStreamMethod, Path: "$", Detail: "流结束前没有完成的模型回复"}
 	}
 	var events []Event
 	switch {
 	case d.block:
 		events = d.callBlock(d.held + "\n" + assistantFence)
-	case !d.called && d.held != "":
+	case !d.called && d.held != "" && (!(d.malformed || d.invalidTool) || strings.TrimSpace(d.held) != ""):
 		events = []Event{{Kind: EventText, Text: d.held}}
 	}
 	events = append(events, d.recorded()...)
 	finish := decodeFinishReason(1)
-	if d.malformed {
+	if !d.called && (d.malformed || d.invalidTool) {
 		finish = decodeFinishReason(10)
 	}
 	return append(events, Event{Kind: EventFinish, FinishReason: finish}), nil

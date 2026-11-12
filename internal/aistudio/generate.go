@@ -824,14 +824,19 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 	request.Contents = applySpeechTranscript(request.Contents, entry.model, request.Config)
 	wireRequest := request
 	wireRequest.Config.StopSequences = nil
+	// accountCtx 是发送请求所用的上下文，续写轮换账户后为新账户的上下文
+	accountCtx := ctx
+	switched := func(next context.Context, accountID string) {
+		accountCtx, request.AccountID, wireRequest.AccountID = next, accountID, accountID
+	}
 	sendRequest := func() (*RPCResponse, func(io.Reader, func(Event) error) error, error) {
 		switch {
 		case entry.model.Capabilities["assistant_route"]:
-			return c.sendAssistant(ctx, wireRequest, entry)
+			return c.sendAssistant(accountCtx, wireRequest, entry)
 		case build:
-			return c.sendBuild(ctx, wireRequest, entry)
+			return c.sendBuild(accountCtx, wireRequest, entry)
 		default:
-			return c.sendPlayground(ctx, wireRequest, entry)
+			return c.sendPlayground(accountCtx, wireRequest, entry, switched)
 		}
 	}
 	response, decodeStream, err := sendRequest()
@@ -867,6 +872,7 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 			}
 		}
 		var usage *Usage
+		var previousUsage *Usage
 		var finish *Event
 		var output Output
 		// turn 是按上游顺序未合并的本轮 Part 与轮次令牌，生成完整结束后保存供下一轮补回
@@ -887,9 +893,16 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 		matchedStopSequence := ""
 		emitEvent := func(event Event) error {
 			turn.turnToken = cmp.Or(event.TurnToken, turn.turnToken)
+			if previousUsage != nil && event.FrameUsage != nil {
+				merged := mergeContinuedUsage(*previousUsage, *event.FrameUsage)
+				event.FrameUsage = &merged
+			}
 			switch event.Kind {
 			case EventUsage:
 				value := *event.Usage
+				if previousUsage != nil {
+					value = mergeContinuedUsage(*previousUsage, value)
+				}
 				usage = &value
 				return nil
 			case EventFinish:
@@ -929,11 +942,65 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 				return send(event)
 			}
 		}
-		emit := stopSequenceEmitter(matcher, emitEvent, &matchedStopSequence)
-		err := decodeStream(observeStreamActivity(ctx, response.Body), emit)
-		for regenerated := 0; regenerated < regenerations && regenerable(ctx, err, finish, committed); regenerated++ {
+		var stripper *continuationPrefixStripper
+		// roundUsage 是本次尝试最近一帧的上游用量，流中断时没有用量事件，续写按它合并
+		var roundUsage *Usage
+		roundEmit := func() func(Event) error {
+			emit := stopSequenceEmitter(matcher, emitEvent, &matchedStopSequence)
+			return func(event Event) error {
+				turn.turnToken = cmp.Or(event.TurnToken, turn.turnToken)
+				roundUsage = cmp.Or(event.FrameUsage, roundUsage)
+				return stripper.filter(event, emit)
+			}
+		}
+		err := decodeStream(observeStreamActivity(ctx, response.Body), roundEmit())
+		assistant := entry.model.Capabilities["assistant_route"]
+		for regenerated := 0; regenerated < regenerations; regenerated++ {
+			// 写代码助手的调用块错误已在应用内续写，这里只重新生成发送与读取失败
+			if assistant && err == nil {
+				break
+			}
+			// emittedText 是续写时已向客户端输出的纯文本，为空时从头重新生成
+			emittedText := ""
+			if !regenerable(ctx, err, finish, committed) {
+				text, ok := committedTextOnly(output)
+				if !ok || assistant || !regenerable(ctx, err, finish, false) {
+					break
+				}
+				emittedText = text
+			}
 			stopClose()
 			_ = response.Body.Close()
+			if emittedText != "" {
+				trimTrailingSignatureParts(&output.Parts)
+				trimTrailingSignatureParts(&turn.parts)
+				turn.turnToken = ""
+				switch {
+				case usage != nil:
+					previousUsage = usage
+				case roundUsage != nil && previousUsage != nil:
+					merged := mergeContinuedUsage(*previousUsage, *roundUsage)
+					previousUsage = &merged
+				case roundUsage != nil:
+					previousUsage = roundUsage
+				}
+				wireRequest = request
+				wireRequest.Config.StopSequences = nil
+				wireRequest.turnToken = ""
+				contents := make([]Content, 0, len(request.Contents)+2)
+				contents = append(contents, request.Contents...)
+				contents = append(contents,
+					Content{Role: RoleAssistant, Parts: []Part{{Text: emittedText}}},
+					Content{Role: RoleUser, Parts: []Part{{Text: partialContinuationPrompt(emittedText, finish)}}},
+				)
+				wireRequest.Contents = contents
+				usage, finish = nil, nil
+				stripper = newContinuationPrefixStripper(emittedText)
+			} else {
+				usage, finish, sources, turn = nil, nil, nil, modelTurn{}
+				stripper = nil
+			}
+			roundUsage = nil
 			if response, decodeStream, err = sendRequest(); err != nil {
 				if ctx.Err() == nil {
 					_ = send(Event{Kind: EventError, Err: err})
@@ -941,10 +1008,8 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 				return
 			}
 			stopClose = closeOnCancel(response)
-			usage, finish, sources, turn = nil, nil, nil, modelTurn{}
 			matcher = newStopSequenceMatcher(request.Config.StopSequences)
-			emit = stopSequenceEmitter(matcher, emitEvent, &matchedStopSequence)
-			err = decodeStream(observeStreamActivity(ctx, response.Body), emit)
+			err = decodeStream(observeStreamActivity(ctx, response.Body), roundEmit())
 		}
 		if releaseSources() != nil {
 			return
@@ -971,6 +1036,9 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 			return
 		}
 		if finish != nil && contentPolicyFinish(finish.FinishReason) {
+			if usage == nil {
+				usage = previousUsage
+			}
 			if usage != nil && send(Event{Kind: EventUsage, Usage: usage}) != nil {
 				return
 			}
@@ -978,6 +1046,9 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 				_ = send(Event{Kind: EventError, Err: &ContentPolicyError{Reason: finish.FinishReason, Message: finish.FinishMessage}})
 			}
 			return
+		}
+		if usage == nil {
+			usage = previousUsage
 		}
 		if usage == nil {
 			usage = localCompleteUsage(request, output)
@@ -1011,6 +1082,205 @@ func contentPolicyFinish(reason string) bool {
 	return false
 }
 
+// abnormalGenerationFinish 表示结束原因属于异常工具调用或格式错误响应：格式错误的函数调用、意外的工具调用与格式错误的响应
+func abnormalGenerationFinish(reason string) bool {
+	switch reason {
+	case "malformed_function_call", "unexpected_tool_call", "malformed_response":
+		return true
+	}
+	return false
+}
+
+// committedTextOnly 返回已向客户端提交的纯文本输出，没有可见文本或含函数调用、媒体、代码与服务端工具步骤时返回 false
+func committedTextOnly(output Output) (string, bool) {
+	visible := output.Visible()
+	if len(visible) == 0 {
+		return "", false
+	}
+	var text strings.Builder
+	for _, part := range visible {
+		if part.SignatureOnly() {
+			continue
+		}
+		if !part.textOnly() {
+			return "", false
+		}
+		text.WriteString(part.Text)
+	}
+	if text.Len() == 0 {
+		return "", false
+	}
+	return text.String(), true
+}
+
+// trimTrailingSignatureParts 去掉失败尝试末尾只有思考签名的 Part
+func trimTrailingSignatureParts(parts *[]Part) {
+	items := *parts
+	for len(items) > 0 && items[len(items)-1].SignatureOnly() {
+		items = items[:len(items)-1]
+	}
+	*parts = items
+}
+
+// partialReplyRunes 是续写恢复提示带上的已输出正文末尾的字符数上限
+const partialReplyRunes = 20000
+
+// partialReplyTail 返回已输出正文末尾至多 partialReplyRunes 个 Unicode 字符
+func partialReplyTail(text string) string {
+	runes := []rune(text)
+	if len(runes) > partialReplyRunes {
+		return string(runes[len(runes)-partialReplyRunes:])
+	}
+	return text
+}
+
+// partialContinuationPrompt 构造在已输出部分正文后继续生成或补发有效工具调用的用户提示
+func partialContinuationPrompt(emittedText string, finish *Event) string {
+	reason := "Your last turn was cut off by an internal error."
+	if finish != nil {
+		switch finish.FinishReason {
+		case "malformed_function_call":
+			reason = "Your last turn was cut off because the function call was malformed."
+		case "unexpected_tool_call":
+			reason = "Your last turn was cut off because of an unexpected tool call."
+		case "malformed_response":
+			reason = "Your last turn was cut off because the response was malformed."
+		}
+	}
+	return fmt.Sprintf(
+		"%s The user already received your reply up to the end of this text:\n<partial_reply>\n%s\n</partial_reply>\nContinue immediately right after <partial_reply> without repeating it, and emit the valid tool call or remaining response.",
+		reason, partialReplyTail(emittedText),
+	)
+}
+
+// continuationPrefixStripper 在续写恢复轮次去掉开头重复已输出正文的前缀，尚未确定是否完全匹配时暂存前缀
+type continuationPrefixStripper struct {
+	targets    []string
+	pending    string
+	pendingSig string
+	active     bool
+}
+
+// newContinuationPrefixStripper 返回按已输出正文全文、去尾空白与末尾片段去重的前缀过滤器
+func newContinuationPrefixStripper(emittedText string) *continuationPrefixStripper {
+	if emittedText == "" {
+		return nil
+	}
+	tail := partialReplyTail(emittedText)
+	candidates := []string{
+		emittedText,
+		strings.TrimRight(emittedText, " \t\r\n"),
+		tail,
+		strings.TrimRight(tail, " \t\r\n"),
+	}
+	targets := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate == "" || slices.Contains(targets, candidate) {
+			continue
+		}
+		targets = append(targets, candidate)
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	slices.SortStableFunc(targets, func(left string, right string) int {
+		return cmp.Compare(len(right), len(left))
+	})
+	return &continuationPrefixStripper{targets: targets, active: true}
+}
+
+// longerPrefixPending 表示 combined 是 targets[:index] 中某个更长候选的前缀
+func (s *continuationPrefixStripper) longerPrefixPending(index int, combined string) bool {
+	for _, longer := range s.targets[:index] {
+		if len(combined) < len(longer) && strings.HasPrefix(longer, combined) {
+			return true
+		}
+	}
+	return false
+}
+
+// flush 停止去重并输出尚未确认重复的暂存正文
+func (s *continuationPrefixStripper) flush(emit func(Event) error) error {
+	s.active = false
+	if s.pending == "" {
+		return nil
+	}
+	text, sig := s.pending, s.pendingSig
+	s.pending, s.pendingSig = "", ""
+	return emit(Event{Kind: EventText, Text: text, ThoughtSignature: sig})
+}
+
+// filter 过滤续写轮开头重复的已输出正文前缀并保留思考签名
+func (s *continuationPrefixStripper) filter(event Event, emit func(Event) error) error {
+	if s == nil || !s.active {
+		return emit(event)
+	}
+	if event.Kind != EventText {
+		switch event.Kind {
+		case EventUsage, EventReasoning, EventGrounding, EventCitation:
+			return emit(event)
+		case EventThoughtSignature:
+			if s.pending == "" {
+				return emit(event)
+			}
+		}
+		if err := s.flush(emit); err != nil {
+			return err
+		}
+		return emit(event)
+	}
+	if event.Transcript != nil {
+		if err := s.flush(emit); err != nil {
+			return err
+		}
+		return emit(event)
+	}
+	combined := s.pending + event.Text
+	sig := cmp.Or(event.ThoughtSignature, s.pendingSig)
+	for index, target := range s.targets {
+		if strings.HasPrefix(combined, target) {
+			if index > 0 && s.longerPrefixPending(index, combined) {
+				break
+			}
+			rest := strings.TrimPrefix(combined, target)
+			s.pending = ""
+			s.pendingSig = ""
+			s.active = false
+			if rest == "" {
+				if sig != "" {
+					return emit(Event{
+						Kind:          EventThoughtSignature,
+						Part:          Part{ThoughtSignature: sig},
+						ProviderModel: event.ProviderModel,
+						TurnToken:     event.TurnToken,
+						DebugInfo:     event.DebugInfo,
+						ResponseID:    event.ResponseID,
+						FrameUsage:    event.FrameUsage,
+						FinishFrame:   event.FinishFrame,
+					})
+				}
+				return nil
+			}
+			event.Text = rest
+			event.ThoughtSignature = sig
+			return emit(event)
+		}
+	}
+	for _, target := range s.targets {
+		if strings.HasPrefix(target, combined) {
+			s.pending = combined
+			s.pendingSig = sig
+			return nil
+		}
+	}
+	s.pending = ""
+	s.pendingSig = ""
+	s.active = false
+	event.Text = combined
+	event.ThoughtSignature = sig
+	return emit(event)
+}
+
 // regenerable 表示上游以函数调用格式错误、意外的工具调用或响应格式异常结束、流在完成帧之前中断或流尾为 5xx 错误，且本次生成还没有不能丢弃的输出
 func regenerable(ctx context.Context, err error, finish *Event, committed bool) bool {
 	if err != nil {
@@ -1019,7 +1289,7 @@ func regenerable(ctx context.Context, err error, finish *Event, committed bool) 
 		if ctx.Err() != nil || !errors.As(err, &interrupted) && !(errors.As(err, &rpcError) && rpcError.StatusCode >= http.StatusInternalServerError) {
 			return false
 		}
-	} else if finish == nil || finish.FinishReason != "malformed_function_call" && finish.FinishReason != "unexpected_tool_call" && finish.FinishReason != "malformed_response" {
+	} else if finish == nil || !abnormalGenerationFinish(finish.FinishReason) {
 		return false
 	}
 	return !committed
@@ -1145,8 +1415,8 @@ func nextConversationTurn(contents []Content) int {
 	return -1
 }
 
-// sendPlayground 编码并发送 Playground GenerateContent，返回响应与含完成帧校验的流解码
-func (c *Client) sendPlayground(ctx context.Context, request GenerateRequest, entry modelEntry) (*RPCResponse, func(io.Reader, func(Event) error) error, error) {
+// sendPlayground 编码并发送 Playground GenerateContent，返回响应与含完成帧校验的流解码，续写轮换账户后以新账户的上下文与 ID 调用 switched
+func (c *Client) sendPlayground(ctx context.Context, request GenerateRequest, entry modelEntry, switched func(context.Context, string)) (*RPCResponse, func(io.Reader, func(Event) error) error, error) {
 	reason := ""
 	if request.Unary {
 		reason = "Playground GenerateContent 使用服务端流，收集完成后返回"
@@ -1168,13 +1438,25 @@ func (c *Client) sendPlayground(ctx context.Context, request GenerateRequest, en
 	if err != nil {
 		return nil, nil, err
 	}
+	request.continuationProof = response.Proof
 	return response, func(source io.Reader, emit func(Event) error) error {
-		return c.decodePlaygroundRounds(ctx, request, entry.defaults, runtime, source, restoreFunctionNames(request.Tools.Functions, emit))
+		return c.decodePlaygroundRounds(ctx, request, entry.defaults, runtime, source, restoreFunctionNames(request.Tools.Functions, emit), switched)
 	}, nil
 }
 
-// decodePlaygroundRounds 解码 GenerateContent 流，上游要求续写时携带续写 token 发送下一轮，各轮输出依次转发
-func (c *Client) decodePlaygroundRounds(ctx context.Context, request GenerateRequest, defaults GenerationDefaults, runtime RequestContext, source io.Reader, emit func(Event) error) error {
+// continuationAccountsKey 是上下文中续写轮换账户函数的键
+type continuationAccountsKey struct{}
+
+// ContinuationAccounts 在续写轮以可换账户的错误失败后返回改由其他账户发送该轮的上下文
+type ContinuationAccounts func(context.Context, error) (context.Context, error)
+
+// ContextWithContinuationAccounts 返回续写轮可经 accounts 换账户发送的上下文
+func ContextWithContinuationAccounts(ctx context.Context, accounts ContinuationAccounts) context.Context {
+	return context.WithValue(ctx, continuationAccountsKey{}, accounts)
+}
+
+// decodePlaygroundRounds 解码 GenerateContent 流，上游要求续写时携带续写 token 发送下一轮，续写轮以可换账户的错误失败时经上下文中的 ContinuationAccounts 换账户重发并调用 switched，没有其他账户时返回该轮的上游错误，各轮输出依次转发
+func (c *Client) decodePlaygroundRounds(ctx context.Context, request GenerateRequest, defaults GenerationDefaults, runtime RequestContext, source io.Reader, emit func(Event) error, switched func(context.Context, string)) error {
 	total := int64(0)
 	if defaults.ContinuedOutputTokens > 0 {
 		config, err := encodeGenerationConfig(request.Config, defaults)
@@ -1233,9 +1515,37 @@ func (c *Client) decodePlaygroundRounds(ctx context.Context, request GenerateReq
 		}
 		closeRound()
 		response, err := c.doProtected(ctx, request, body)
+		for err != nil && retryableAccountError(err) {
+			accounts, ok := ctx.Value(continuationAccountsKey{}).(ContinuationAccounts)
+			if !ok {
+				break
+			}
+			next, switchErr := accounts(ctx, err)
+			if switchErr != nil {
+				if !errors.Is(switchErr, ErrNoEligibleAccount) {
+					err = errors.Join(err, switchErr)
+				}
+				break
+			}
+			ctx = next
+			lease, _ := AccountLeaseFromContext(ctx)
+			request.AccountID, request.continuationProof = lease.Account().ID, ""
+			switched(ctx, request.AccountID)
+			if c.contextProvider != nil {
+				if runtime, err = c.contextProvider.RequestContext(ctx, request.AccountID); err != nil {
+					return fmt.Errorf("读取 AI Studio 请求上下文: %w", err)
+				}
+			}
+			if body, err = EncodeGenerateContentRequest(request, defaults, runtime); err != nil {
+				return err
+			}
+			reportUpstreamMode(ctx, "GenerateContent", fmt.Sprintf("stream | 续写=%d", request.continuationRound), "")
+			response, err = c.doProtected(ctx, request, body)
+		}
 		if err != nil {
 			return err
 		}
+		request.continuationProof = response.Proof
 		stopClose := context.AfterFunc(ctx, func() {
 			_ = response.Body.Close()
 		})
