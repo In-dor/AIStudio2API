@@ -2,12 +2,10 @@ package aistudio
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -123,7 +121,11 @@ func (worker *NativeWorker) Prepare(ctx context.Context, request ProtectedReques
 	proof := request.Proof
 	var headers http.Header
 	if proof == "" {
-		proof, headers, err = worker.proofAndHeaders(ctx, request.Prompt, request.PromptHash, request.PagePrompt, strings.HasSuffix(request.URL, "/GenerateContent") && request.PagePrompt != "")
+		gesture := ctx
+		if !strings.HasSuffix(request.URL, "/GenerateTitle") {
+			gesture = context.WithValue(ctx, userGestureKey{}, true)
+		}
+		proof, headers, err = worker.proofAndHeaders(gesture, proofDigest(request), request.PagePrompt, strings.HasSuffix(request.URL, "/GenerateContent") && request.PagePrompt != "")
 	} else {
 		headers, err = worker.current().ProtocolHeaders(ctx)
 	}
@@ -141,24 +143,18 @@ type pageRunner interface {
 	RunProof(context.Context, string, string) (string, error)
 }
 
-// proofAndHeaders 把 page 写入页面提示词后为 binding 或其 SHA-256 生成 fresh proof，run 时写入后点击 Run，再取公共协议头
-func (worker *NativeWorker) proofAndHeaders(ctx context.Context, binding, bindingHash, page string, run bool) (string, http.Header, error) {
+// proofAndHeaders 把 page 写入页面提示词后为 digest 生成 fresh proof，run 时写入后点击 Run，再取公共协议头
+func (worker *NativeWorker) proofAndHeaders(ctx context.Context, digest, page string, run bool) (string, http.Header, error) {
 	worker.operationMu.Lock()
 	defer worker.operationMu.Unlock()
 	worker.setPhase(WorkerBusy)
-	hexHash := bindingHash
-	if hexHash == "" {
-		hasher := sha256.New()
-		_, _ = io.WriteString(hasher, binding)
-		hexHash = fmt.Sprintf("%x", hasher.Sum(nil))
-	}
 	runtime := worker.current()
 	var proof string
 	var err error
 	if runner, ok := runtime.(pageRunner); ok && run {
-		proof, err = runner.RunProof(ctx, hexHash, page)
+		proof, err = runner.RunProof(ctx, digest, page)
 	} else {
-		proof, err = runtime.Proof(ctx, hexHash, page)
+		proof, err = runtime.Proof(ctx, digest, page)
 	}
 	var headers http.Header
 	if err == nil {
@@ -260,19 +256,14 @@ func (worker *NativeWorker) SendProtected(ctx context.Context, request Protected
 	}, nil
 }
 
-// generate 在页面界面运行 GenerateContent，proof 绑定 request.Prompt 的 SHA-256
+// generate 在页面界面运行 GenerateContent，proof 绑定 proofDigest(request)
 func (worker *NativeWorker) generate(ctx context.Context, generator pageGenerator, request ProtectedRequest) (*RPCResponse, error) {
 	start, end, err := arrayElementSpan(request.Body, request.ProofField-1)
 	if err != nil {
 		return nil, fmt.Errorf("受保护请求缺少 WAA field %d: %w", request.ProofField, err)
 	}
-	hexHash := request.PromptHash
-	if hexHash == "" {
-		digest := sha256.Sum256([]byte(request.Prompt))
-		hexHash = fmt.Sprintf("%x", digest)
-	}
 	worker.setPhase(WorkerBusy)
-	response, err := generator.Generate(ctx, camoufoxnative.GenerateTurn{Body: request.Body, ProofStart: start, ProofEnd: end, Digest: hexHash})
+	response, err := generator.Generate(ctx, camoufoxnative.GenerateTurn{Body: request.Body, ProofStart: start, ProofEnd: end, Digest: proofDigest(request)})
 	if err != nil {
 		if ctx.Err() != nil {
 			worker.setPhase(WorkerReady)
