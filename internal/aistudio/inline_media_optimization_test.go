@@ -580,3 +580,168 @@ func TestUploadInlineMediaKeepImages(t *testing.T) {
 		t.Fatalf("expected exactly 1 synchronous Drive upload (PDF only), got %d", uploadCount)
 	}
 }
+
+type mockPageUploaderRuntime struct {
+	workerRuntime
+	token         string
+	beforeCalled  int
+	uploadedFiles []FileRef
+}
+
+func (m *mockPageUploaderRuntime) beforeUpload(_ context.Context) string {
+	m.beforeCalled++
+	return m.token
+}
+
+func (m *mockPageUploaderRuntime) uploaded(ctx context.Context, files []FileRef, drive pageDrive) {
+	m.uploadedFiles = append(m.uploadedFiles, files...)
+	for _, f := range files {
+		if drive.count != nil {
+			_, _ = drive.count(ctx, []byte(`[]`))
+		}
+		if drive.read != nil {
+			drive.read(ctx, f.ID)
+		}
+	}
+}
+
+// TestUploadInlineMediaWithPageUploaderAndGetAppFolderNoAuth 验证 Case 3 融合 pageUploader（安全断言 DriveFileReader 不 panic）及 GetAppFolder unauthorized_client 缓存与回退
+func TestUploadInlineMediaWithPageUploaderAndGetAppFolderNoAuth(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("pageUploader with non-DriveFileReader transport", func(t *testing.T) {
+		base := &testRPCTransport{
+			handler: func(req RPCRequest) (*RPCResponse, error) {
+				if req.Method == "GetAppFolder" {
+					return &RPCResponse{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{JSONProtobufContentType}},
+						Body:       io.NopCloser(strings.NewReader(`["mock-folder"]`)),
+					}, nil
+				}
+				return &RPCResponse{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{JSONProtobufContentType}},
+					Body:       io.NopCloser(strings.NewReader(`["ok"]`)),
+				}, nil
+			},
+		}
+		transport := &testDriveRPCTransport{testRPCTransport: base}
+		acc := &Account{
+			ID:      "acc-uploader",
+			Config:  AccountConfig{Enabled: true},
+			State:   AccountReady,
+			Models:  []Model{{ID: "gemini-2.5-flash", Methods: []string{"generateContent"}}},
+			runtime: accountRuntimeState{Resources: make(map[string]ResourceBinding)},
+		}
+		pool := NewAccountPool([]*Account{acc}, 2)
+		client := NewClient(ClientOptions{Transport: transport})
+		service := NewPooledService(pool, client)
+
+		mockRuntime := &mockPageUploaderRuntime{token: "page-cached-token"}
+		pageWorkers.Store("acc-uploader", &NativeWorker{accountID: "acc-uploader", runtime: mockRuntime})
+		t.Cleanup(func() { pageWorkers.Delete("acc-uploader") })
+
+		lease, err := pool.AcquireFor(ctx, AccountSelection{AccountID: "acc-uploader", anyState: true})
+		if err != nil {
+			t.Fatalf("AcquireFor failed: %v", err)
+		}
+		defer func() { _ = lease.Release() }()
+
+		contents := []Content{
+			{
+				Role: RoleUser,
+				Parts: []Part{
+					{InlineData: &Blob{MIME: "video/mp4", Data: []byte("mock-video-bytes")}, DisplayName: "clip.mp4"},
+				},
+			},
+		}
+		rewritten, copies, err := service.UploadInlineMediaToLease(ctx, lease, contents, nil, false)
+		if err != nil {
+			t.Fatalf("UploadInlineMediaToLease failed: %v", err)
+		}
+		defer func() { _ = copies.Cleanup() }()
+
+		if mockRuntime.beforeCalled != 1 {
+			t.Errorf("expected beforeUpload called once, got %d", mockRuntime.beforeCalled)
+		}
+		if len(mockRuntime.uploadedFiles) != 1 || mockRuntime.uploadedFiles[0].ID != "drive-uploaded-1" {
+			t.Errorf("unexpected uploadedFiles: %+v", mockRuntime.uploadedFiles)
+		}
+		if rewritten[0].Parts[0].File == nil || rewritten[0].Parts[0].File.ID != "drive-uploaded-1" {
+			t.Errorf("expected rewritten file ref, got %+v", rewritten[0].Parts[0])
+		}
+		base.mu.Lock()
+		genTokenCalls := base.callCounts["GenerateAccessToken"]
+		countCalls := base.callCounts["CountTokens"]
+		base.mu.Unlock()
+		if genTokenCalls != 0 {
+			t.Errorf("expected GenerateAccessToken skipped when page token available, got %d", genTokenCalls)
+		}
+		if countCalls != 1 {
+			t.Errorf("expected companion CountTokens called once, got %d", countCalls)
+		}
+	})
+
+	t.Run("GetAppFolder unauthorized_client caches driveNoAuth and falls back inline", func(t *testing.T) {
+		base := &testRPCTransport{
+			handler: func(req RPCRequest) (*RPCResponse, error) {
+				if req.Method == "GetAppFolder" {
+					return nil, &RPCError{
+						Method:     "GetAppFolder",
+						StatusCode: http.StatusUnauthorized,
+						Code:       16,
+						Message:    "OAuth error: unauthorized_client.",
+					}
+				}
+				return &RPCResponse{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{JSONProtobufContentType}},
+					Body:       io.NopCloser(strings.NewReader(`["ok"]`)),
+				}, nil
+			},
+		}
+		transport := &testDriveRPCTransport{testRPCTransport: base}
+		acc := &Account{
+			ID:      "acc-folder-noauth",
+			Config:  AccountConfig{Enabled: true},
+			State:   AccountReady,
+			Models:  []Model{{ID: "gemini-2.5-flash", Methods: []string{"generateContent"}}},
+			runtime: accountRuntimeState{Resources: make(map[string]ResourceBinding)},
+		}
+		pool := NewAccountPool([]*Account{acc}, 2)
+		client := NewClient(ClientOptions{Transport: transport})
+		service := NewPooledService(pool, client)
+
+		mockRuntime := &mockPageUploaderRuntime{token: "page-cached-token"}
+		pageWorkers.Store("acc-folder-noauth", &NativeWorker{accountID: "acc-folder-noauth", runtime: mockRuntime})
+		t.Cleanup(func() { pageWorkers.Delete("acc-folder-noauth") })
+
+		lease, err := pool.AcquireFor(ctx, AccountSelection{AccountID: "acc-folder-noauth", anyState: true})
+		if err != nil {
+			t.Fatalf("AcquireFor failed: %v", err)
+		}
+		defer func() { _ = lease.Release() }()
+
+		contents := []Content{
+			{
+				Role: RoleUser,
+				Parts: []Part{
+					{InlineData: &Blob{MIME: "video/mp4", Data: []byte("mock-video-bytes")}, DisplayName: "clip.mp4"},
+				},
+			},
+		}
+		rewritten, copies, err := service.UploadInlineMediaToLease(ctx, lease, contents, nil, false)
+		if err != nil {
+			t.Fatalf("expected inline fallback on GetAppFolder unauthorized_client, got err: %v", err)
+		}
+		defer func() { _ = copies.Cleanup() }()
+
+		if !client.isDriveAuthMissing("acc-folder-noauth") {
+			t.Errorf("expected isDriveAuthMissing to be true after GetAppFolder unauthorized_client")
+		}
+		if rewritten[0].Parts[0].InlineData == nil || rewritten[0].Parts[0].File != nil {
+			t.Errorf("expected part to remain inline on fallback, got %+v", rewritten[0].Parts[0])
+		}
+	})
+}

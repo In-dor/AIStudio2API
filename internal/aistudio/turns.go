@@ -148,4 +148,3 @@ func sanitizeThoughtSignatures(contents []Content) []Content {
 	}
 	return cleanedContents
 }
-

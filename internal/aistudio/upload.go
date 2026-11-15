@@ -418,6 +418,11 @@ func (c *Client) appFolder(ctx context.Context, accountID string) (string, error
 
 	response, err := c.do(ctx, "GetAppFolder", accountID, "", []byte("[]"), false)
 	if err != nil {
+		if driveAuthorizationMissing(err) {
+			c.driveCacheMu.Lock()
+			c.driveNoAuth[accountID] = time.Now().Add(driveNoAuthCacheTTL)
+			c.driveCacheMu.Unlock()
+		}
 		return "", err
 	}
 	defer response.Body.Close()
@@ -793,10 +798,10 @@ func driveFileNotFound(err error, method string) bool {
 	return errors.As(err, &rpcError) && rpcError.Method == method && rpcError.StatusCode == http.StatusNotFound
 }
 
-// driveAuthorizationMissing 判断账户仅缺少 Google Drive 授权
+// driveAuthorizationMissing 判断 GenerateAccessToken 或 GetAppFolder 因账户仅缺少 Google Drive 授权被拒绝
 func driveAuthorizationMissing(err error) bool {
 	var rpcError *RPCError
-	return errors.As(err, &rpcError) && rpcError.Method == "GenerateAccessToken" &&
+	return errors.As(err, &rpcError) && (rpcError.Method == "GenerateAccessToken" || rpcError.Method == "GetAppFolder") &&
 		rpcError.StatusCode == http.StatusUnauthorized && rpcError.Code == 16 &&
 		strings.Contains(strings.ToLower(rpcError.Message), "unauthorized_client")
 }
@@ -1228,9 +1233,16 @@ func (s *PooledService) prewarmInlineMediaAsync(target *AccountLease, jobs []upl
 	defer cancel()
 	ctx = ContextWithAccountLease(ctx, target)
 
-	token, err := s.client.GenerateAccessToken(ctx, targetID)
-	if err != nil {
-		return
+	var token string
+	if uploader, _ := pageOf(targetID).(pageUploader); uploader != nil {
+		token = uploader.beforeUpload(ctx)
+	}
+	if token == "" {
+		var err error
+		token, err = s.client.GenerateAccessToken(ctx, targetID)
+		if err != nil {
+			return
+		}
 	}
 	folder, err := s.client.appFolder(ctx, targetID)
 	if err != nil {
@@ -1397,31 +1409,51 @@ func (s *PooledService) UploadInlineMediaToLease(
 	}
 
 	// Case 3: Synchronous Drive Upload Path (uncached media > 15 MiB, contains video, or non-image on InteractionStream)
-	var folder string
+	var token, folder string
 	var folderErr error
-	var lookup sync.WaitGroup
-	lookup.Go(func() { folder, folderErr = s.client.appFolder(targetCtx, targetID) })
-	token, err := s.client.GenerateAccessToken(targetCtx, targetID)
-	lookup.Wait()
-	if err != nil {
-		temporary.release = s.useInlineMedia(used)
-		if driveAuthorizationMissing(err) {
-			return rewritten, temporary, nil
-		}
-		if DefinitiveAuthenticationFailure(err) {
-			err = errors.Join(err, target.ConfirmAuthenticationFailure(targetCtx, err))
-		}
-		return nil, nil, errors.Join(err, temporary.Cleanup())
+	last := len(rewritten) - 1
+	staged := slices.DeleteFunc(slices.Clone(pending), func(job uploadJob) bool {
+		return rewritten[last].Role != RoleUser || !slices.ContainsFunc(parts[job.key], func(index partIndex) bool { return index.content == last })
+	})
+	uploader, _ := pageOf(targetID).(pageUploader)
+	if uploader != nil && len(staged) > 0 {
+		token = uploader.beforeUpload(targetCtx)
 	}
-	for _, id := range expired {
-		temporary.copies = append(temporary.copies, temporaryDriveCopy{id: id, token: token, bound: true})
+	if len(pending) > 0 || len(expired) > 0 {
+		var lookup sync.WaitGroup
+		if len(pending) > 0 {
+			lookup.Go(func() { folder, folderErr = s.client.appFolder(targetCtx, targetID) })
+		}
+		if token == "" {
+			token, err = s.client.GenerateAccessToken(targetCtx, targetID)
+		}
+		lookup.Wait()
+		if err != nil {
+			temporary.release = s.useInlineMedia(used)
+			if driveAuthorizationMissing(err) {
+				return rewritten, temporary, nil
+			}
+			if DefinitiveAuthenticationFailure(err) {
+				err = errors.Join(err, target.ConfirmAuthenticationFailure(targetCtx, err))
+			}
+			return nil, nil, errors.Join(err, temporary.Cleanup())
+		}
 	}
 	if folderErr != nil {
 		temporary.release = s.useInlineMedia(used)
+		if driveAuthorizationMissing(folderErr) {
+			return rewritten, temporary, nil
+		}
+		for _, id := range expired {
+			temporary.copies = append(temporary.copies, temporaryDriveCopy{id: id, token: token, bound: true})
+		}
 		if DefinitiveAuthenticationFailure(folderErr) {
 			folderErr = errors.Join(folderErr, target.ConfirmAuthenticationFailure(targetCtx, folderErr))
 		}
 		return nil, nil, errors.Join(folderErr, temporary.Cleanup())
+	}
+	for _, id := range expired {
+		temporary.copies = append(temporary.copies, temporaryDriveCopy{id: id, token: token, bound: true})
 	}
 
 	drive, ok := s.client.transport.(DriveTransport)
@@ -1513,13 +1545,33 @@ func (s *PooledService) UploadInlineMediaToLease(
 			part.File = &file
 		}
 	}
-
-	stateErr := errors.Join(
-		target.MarkAuthenticationValid(),
-		s.pool.ClearCooldownIfGeneration(targetID, "", target.ModelAccessGeneration(), target.CheckedAt()),
-	)
-	if stateErr != nil {
-		return nil, nil, errors.Join(stateErr, temporary.Cleanup())
+	if uploader != nil && len(staged) > 0 {
+		refs := make([]FileRef, 0, len(staged))
+		for _, job := range staged {
+			if file, ok := files[job.key]; ok {
+				refs = append(refs, file)
+			}
+		}
+		reader, _ := s.client.transport.(DriveFileReader)
+		uploader.uploaded(targetCtx, refs, pageDrive{
+			count: func(ctx context.Context, body []byte) ([]byte, error) {
+				return s.client.readRPC(ctx, "CountTokens", targetID, body)
+			},
+			read: func(ctx context.Context, fileID string) {
+				if reader != nil {
+					reader.ReadDriveFile(ctx, targetID, token, fileID)
+				}
+			},
+		})
+	}
+	if len(pending) > 0 {
+		stateErr := errors.Join(
+			target.MarkAuthenticationValid(),
+			s.pool.ClearCooldownIfGeneration(targetID, "", target.ModelAccessGeneration(), target.CheckedAt()),
+		)
+		if stateErr != nil {
+			return nil, nil, errors.Join(stateErr, temporary.Cleanup())
+		}
 	}
 	return rewritten, temporary, nil
 }
@@ -1584,6 +1636,11 @@ func (t *MakerSuiteHTTPTransport) UploadDrive(ctx context.Context, accountID str
 	return uploadDriveMultipart(ctx, client, driveUploadURL+url.QueryEscape(apiKey), headers, request)
 }
 
+// clientDetails 返回官网页面 gapi 请求的 X-ClientDetails：按 encodeURIComponent 写出的 appVersion、platform 与 User-Agent
+func clientDetails(appVersion, platform, userAgent string) string {
+	return "appVersion=" + uriComponent(appVersion) + "&platform=" + uriComponent(platform) + "&userAgent=" + uriComponent(userAgent)
+}
+
 // gapiHeaders 返回官网页面 gapi 请求的公共头与页面的 API key，X-ClientDetails 取账户指纹的 appVersion、platform 与 User-Agent
 func (t *MakerSuiteHTTPTransport) gapiHeaders(ctx context.Context, account *Account) (http.Header, string, error) {
 	public, err := t.headers.ProtocolHeaders(ctx, account.ID)
@@ -1608,7 +1665,7 @@ func (t *MakerSuiteHTTPTransport) gapiHeaders(ctx context.Context, account *Acco
 	headers.Set("X-JavaScript-User-Agent", "google-api-javascript-client/1.1.0")
 	headers.Set("X-Requested-With", "XMLHttpRequest")
 	headers.Set("X-Goog-Encode-Response-If-Executable", "base64")
-	headers.Set("X-ClientDetails", "appVersion="+uriComponent(appVersion)+"&platform="+uriComponent(platform)+"&userAgent="+uriComponent(userAgent))
+	headers.Set("X-ClientDetails", clientDetails(appVersion, platform, userAgent))
 	headers.Set("Origin", aiStudioOrigin)
 	headers.Set("Sec-Fetch-Dest", "empty")
 	headers.Set("Sec-Fetch-Mode", "cors")
@@ -1638,6 +1695,18 @@ func (t *MakerSuiteHTTPTransport) readDriveDiscovery(ctx context.Context, lease 
 	if loaded {
 		return nil
 	}
+	if err := t.getDriveDiscovery(ctx, lease, client, gapi, apiKey); err != nil {
+		return err
+	}
+	t.driveMu.Lock()
+	t.driveDiscovered[account.ID] = true
+	t.driveMu.Unlock()
+	return nil
+}
+
+// getDriveDiscovery 以页面 gapi 的请求形状读取 Drive v3 discovery 文档
+func (t *MakerSuiteHTTPTransport) getDriveDiscovery(ctx context.Context, lease *AccountLease, client *http.Client, gapi http.Header, apiKey string) error {
+	account := lease.Account()
 	address := fmt.Sprintf(driveDiscoveryURL, url.QueryEscape(apiKey))
 	state, err := lease.ReloadStorageState()
 	if err != nil {
@@ -1672,10 +1741,90 @@ func (t *MakerSuiteHTTPTransport) readDriveDiscovery(ctx context.Context, lease 
 	if response.StatusCode != http.StatusOK {
 		return driveUploadRPCError("DriveDiscovery", response.StatusCode, body)
 	}
-	t.driveMu.Lock()
-	t.driveDiscovered[account.ID] = true
-	t.driveMu.Unlock()
 	return nil
+}
+
+// DriveFileReader 负责像官网对话中显示附件一样读取 Drive 文件
+type DriveFileReader interface {
+	ReadDriveFile(ctx context.Context, accountID, token, fileID string)
+}
+
+// driveFileURL 是页面 gapi 读取对话附件的 ID、类型、名称与缩略图地址的 Drive v3 files.get 地址，参数依次为文件 ID 与 API key
+const driveFileURL = "https://content.googleapis.com/drive/v3/files/%s?supportsAllDrives=true&fields=id%%2C%%20mimeType%%2C%%20name%%2C%%20thumbnailLink&key=%s&%%24unique=gc719"
+
+// ReadDriveFile 像官网对话中新一轮显示附件一样经 gapi 读取 Drive v3 discovery 文档与文件的 ID、类型、名称和缩略图地址，再载入去掉尺寸后缀的缩略图；失败只记日志
+func (t *MakerSuiteHTTPTransport) ReadDriveFile(ctx context.Context, accountID, token, fileID string) {
+	if err := t.getDriveFile(ctx, accountID, token, fileID); err != nil {
+		slog.Warn("读取对话附件失败", "account", accountID, "error", err)
+	}
+}
+
+// getDriveFile 读取一次对话附件的 discovery 文档、元数据与缩略图
+func (t *MakerSuiteHTTPTransport) getDriveFile(ctx context.Context, accountID, token, fileID string) (err error) {
+	lease, owned, err := resolveAccountLease(ctx, t.pool, AccountSelection{AccountID: accountID})
+	if err != nil {
+		return err
+	}
+	if owned {
+		defer func() { err = errors.Join(err, lease.Release()) }()
+	}
+	client, err := t.clientForProxy(lease.Account().EffectiveProxy(t.globalProxy))
+	if err != nil {
+		return err
+	}
+	headers, apiKey, err := t.gapiHeaders(ctx, lease.Account())
+	if err != nil {
+		return err
+	}
+	if err := t.getDriveDiscovery(ctx, lease, client, headers, apiKey); err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf(driveFileURL, url.PathEscape(fileID), url.QueryEscape(apiKey)), nil)
+	if err != nil {
+		return err
+	}
+	request.Header = headers.Clone()
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("Sec-Fetch-Storage-Access", "none")
+	request.Header.Set("Sec-Fetch-Site", "cross-site")
+	response, err := sendHTTP(client, request)
+	if err != nil {
+		return fmt.Errorf("读取 Drive 文件: %w", err)
+	}
+	body, readErr := io.ReadAll(response.Body)
+	if err := errors.Join(readErr, response.Body.Close()); err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusOK {
+		return driveUploadRPCError("DriveGet", response.StatusCode, body)
+	}
+	var file struct {
+		Thumbnail string `json:"thumbnailLink"`
+	}
+	if json.Unmarshal(body, &file) != nil || file.Thumbnail == "" {
+		return nil
+	}
+	thumbnail, _, _ := strings.Cut(file.Thumbnail, "=")
+	image, err := http.NewRequestWithContext(ctx, http.MethodGet, thumbnail, nil)
+	if err != nil {
+		return err
+	}
+	image.Header.Set("User-Agent", headers.Get("User-Agent"))
+	image.Header.Set("Accept", "image/avif,image/jxl,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5")
+	image.Header.Set("Accept-Language", headers.Get("Accept-Language"))
+	image.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+	image.Header.Set("Referer", aiStudioOrigin+"/")
+	image.Header.Set("Sec-Fetch-Storage-Access", "none")
+	image.Header.Set("Sec-Fetch-Dest", "image")
+	image.Header.Set("Sec-Fetch-Mode", "no-cors")
+	image.Header.Set("Sec-Fetch-Site", "cross-site")
+	image.Header.Set("Priority", "u=5, i")
+	response, err = sendHTTP(client, image)
+	if err != nil {
+		return fmt.Errorf("载入附件缩略图: %w", err)
+	}
+	_, readErr = io.Copy(io.Discard, response.Body)
+	return errors.Join(readErr, response.Body.Close())
 }
 
 // uploadDriveMultipart 按官网 gapi 的多部分正文上传：元数据为文件名与应用文件夹，文件部分为 base64

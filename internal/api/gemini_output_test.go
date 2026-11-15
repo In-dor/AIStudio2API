@@ -263,4 +263,3 @@ func TestDecodeGeminiJSON_InlineDataSnakeCase(t *testing.T) {
 		t.Errorf("expected PNG header, got %q", string(parts[0].InlineData.Data))
 	}
 }
-
