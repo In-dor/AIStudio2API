@@ -189,7 +189,16 @@ func TestStickyRoutingForInlineMedia(t *testing.T) {
 		t.Fatalf("expected all 3 accounts to be visited in round-robin for new keys, got %v", roundRobinPicks)
 	}
 
-	// 7. 测试过期时间: 超过 inlineMediaIdle 的缓存不应算作命中
+	// 7. 测试 HasInlineMediaHit 与过期时间: 超过 inlineMediaIdle 的缓存不应算作命中
+	if !pool.HasInlineMediaHit([]string{"acc-1", "acc-2"}, keys) {
+		t.Errorf("expected HasInlineMediaHit true when acc-2 has active cache")
+	}
+	if pool.HasInlineMediaHit([]string{"acc-1"}, keys) {
+		t.Errorf("expected HasInlineMediaHit false for acc-1 without cache")
+	}
+	if pool.HasInlineMediaHit(nil, keys) || pool.HasInlineMediaHit([]string{"acc-2"}, nil) {
+		t.Errorf("expected HasInlineMediaHit false for empty accounts or empty keys")
+	}
 	acc2.runtime.Resources["drive-img-1"] = ResourceBinding{
 		Kind: "inline-media", MIME: keys[0].MIME, SHA256: keys[0].SHA256, DisplayName: keys[0].Name, UsedAt: now.Add(-2 * time.Hour),
 	}
@@ -200,6 +209,9 @@ func TestStickyRoutingForInlineMedia(t *testing.T) {
 	hitsAcc3 := pool.inlineMediaHitsLocked(acc3, keys, now)
 	if hitsAcc2 != 0 || hitsAcc3 != 0 {
 		t.Errorf("expected 0 hits for expired items, got acc2=%d acc3=%d", hitsAcc2, hitsAcc3)
+	}
+	if pool.HasInlineMediaHit([]string{"acc-1", "acc-2", "acc-3"}, keys) {
+		t.Errorf("expected HasInlineMediaHit false when all caches are expired")
 	}
 }
 
@@ -584,13 +596,28 @@ func TestUploadInlineMediaKeepImages(t *testing.T) {
 type mockPageUploaderRuntime struct {
 	workerRuntime
 	token         string
+	denied        bool
 	beforeCalled  int
+	inlinedFiles  []inlineFile
 	uploadedFiles []FileRef
 }
 
-func (m *mockPageUploaderRuntime) beforeUpload(_ context.Context) string {
+func (m *mockPageUploaderRuntime) driveDenied(_ context.Context) bool {
+	return m.denied
+}
+
+func (m *mockPageUploaderRuntime) beforeUpload(_ context.Context, _ bool) string {
 	m.beforeCalled++
 	return m.token
+}
+
+func (m *mockPageUploaderRuntime) inlined(ctx context.Context, _ bool, files []inlineFile, count func(context.Context, []byte) ([]byte, error)) {
+	m.inlinedFiles = append(m.inlinedFiles, files...)
+	for range files {
+		if count != nil {
+			_, _ = count(ctx, []byte(`[]`))
+		}
+	}
 }
 
 func (m *mockPageUploaderRuntime) uploaded(ctx context.Context, files []FileRef, drive pageDrive) {
@@ -742,6 +769,86 @@ func TestUploadInlineMediaWithPageUploaderAndGetAppFolderNoAuth(t *testing.T) {
 		}
 		if rewritten[0].Parts[0].InlineData == nil || rewritten[0].Parts[0].File != nil {
 			t.Errorf("expected part to remain inline on fallback, got %+v", rewritten[0].Parts[0])
+		}
+	})
+
+	t.Run("driveDenied triggers inlined without GenerateAccessToken or GetAppFolder", func(t *testing.T) {
+		base := &testRPCTransport{
+			handler: func(req RPCRequest) (*RPCResponse, error) {
+				return &RPCResponse{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{JSONProtobufContentType}},
+					Body:       io.NopCloser(strings.NewReader(`["ok"]`)),
+				}, nil
+			},
+		}
+		transport := &testDriveRPCTransport{testRPCTransport: base}
+		acc := &Account{
+			ID:      "acc-drive-denied",
+			Config:  AccountConfig{Enabled: true},
+			State:   AccountReady,
+			Models:  []Model{{ID: "gemini-2.5-flash", Methods: []string{"generateContent"}}},
+			runtime: accountRuntimeState{Resources: make(map[string]ResourceBinding)},
+		}
+		pool := NewAccountPool([]*Account{acc}, 2)
+		client := NewClient(ClientOptions{Transport: transport})
+		service := NewPooledService(pool, client)
+
+		mockRuntime := &mockPageUploaderRuntime{denied: true}
+		pageWorkers.Store("acc-drive-denied", &NativeWorker{accountID: "acc-drive-denied", runtime: mockRuntime})
+		t.Cleanup(func() { pageWorkers.Delete("acc-drive-denied") })
+
+		lease, err := pool.AcquireFor(ctx, AccountSelection{AccountID: "acc-drive-denied", anyState: true})
+		if err != nil {
+			t.Fatalf("AcquireFor failed: %v", err)
+		}
+		defer func() { _ = lease.Release() }()
+
+		contents := []Content{
+			{
+				Role: RoleUser,
+				Parts: []Part{
+					{InlineData: &Blob{MIME: "video/mp4", Data: []byte("mock-video-bytes")}, DisplayName: "clip.mp4"},
+				},
+			},
+		}
+		rewritten, copies, err := service.UploadInlineMediaToLease(ctx, lease, contents, nil, false)
+		if err != nil {
+			t.Fatalf("expected inline fallback on driveDenied, got err: %v", err)
+		}
+		defer func() { _ = copies.Cleanup() }()
+
+		if mockRuntime.beforeCalled != 1 {
+			t.Errorf("expected beforeUpload called once, got %d", mockRuntime.beforeCalled)
+		}
+		if len(mockRuntime.inlinedFiles) != 1 || mockRuntime.inlinedFiles[0].name != "clip.mp4" {
+			t.Errorf("expected inlined called with clip.mp4, got %+v", mockRuntime.inlinedFiles)
+		}
+		if len(mockRuntime.uploadedFiles) != 0 {
+			t.Errorf("expected uploaded not called when driveDenied, got %+v", mockRuntime.uploadedFiles)
+		}
+		if rewritten[0].Parts[0].InlineData == nil || rewritten[0].Parts[0].File != nil {
+			t.Errorf("expected part to remain inline when driveDenied, got %+v", rewritten[0].Parts[0])
+		}
+		base.mu.Lock()
+		genTokenCalls := base.callCounts["GenerateAccessToken"]
+		folderCalls := base.callCounts["GetAppFolder"]
+		countCalls := base.callCounts["CountTokens"]
+		base.mu.Unlock()
+		if genTokenCalls != 0 {
+			t.Errorf("expected GenerateAccessToken not called when driveDenied, got %d", genTokenCalls)
+		}
+		if folderCalls != 0 {
+			t.Errorf("expected GetAppFolder not called when driveDenied, got %d", folderCalls)
+		}
+		if countCalls != 1 {
+			t.Errorf("expected CountTokens called once by inlined, got %d", countCalls)
+		}
+		transport.mu.Lock()
+		uploadCount := len(transport.uploads)
+		transport.mu.Unlock()
+		if uploadCount != 0 {
+			t.Errorf("expected 0 Drive uploads when driveDenied, got %d", uploadCount)
 		}
 	})
 }
