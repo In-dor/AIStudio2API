@@ -65,6 +65,11 @@ type Worker struct {
 	tabs map[string]*tabUse
 	// chats 是可运行界面对话的标签页，第一个是当前页面所在的标签页
 	chats []*chatTab
+	// chatsChanged 在界面对话标签页空出或新开结束时关闭
+	chatsChanged chan struct{}
+	// chatOpening 表示正在后台新开界面对话标签页，chatOpenErr 是最近一次新开失败的原因
+	chatOpening bool
+	chatOpenErr error
 	// selected 是浏览器窗口中选中的标签页
 	selected string
 	// inputMu 串行化页面输入与标签页切换，同一时刻只有一个标签页接收指针与输入
@@ -214,7 +219,7 @@ func (worker *Worker) launch(ctx context.Context, options Options, fingerprint m
 		return fmt.Errorf("连接 Camoufox BiDi: %w", err)
 	}
 	worker.connection = connection
-	worker.client = newBiDiClient(connection)
+	worker.client = newBiDiClient(connection, process)
 	worker.client.rhythm = worker.rhythm
 	sessionCtx, cancel := context.WithTimeout(ctx, browserStartupTimeout)
 	defer cancel()
@@ -428,7 +433,7 @@ func (worker *Worker) PageCatalog() PageCatalog {
 	return worker.pageCatalog
 }
 
-// Reload 像官网用户一样在当前标签页中按官网冷启动重新载入页面；当前标签页有进行中的请求时改在新标签页中载入并切换过去，原标签页在其中的请求结束后关闭
+// Reload 像官网用户一样在当前标签页中按官网冷启动重新载入页面，载入期间界面对话不取用该标签页；当前标签页有进行中的请求时改在新标签页中载入并切换过去，原标签页在其中的请求结束后关闭
 func (worker *Worker) Reload(ctx context.Context) error {
 	worker.mu.Lock()
 	if worker.closed {
@@ -443,6 +448,16 @@ func (worker *Worker) Reload(ctx context.Context) error {
 	worker.mu.Lock()
 	contextID := worker.contextID
 	busy := worker.tabs[contextID] != nil
+	if !busy {
+		reloading := worker.chats[0]
+		reloading.busy, reloading.resetting = true, true
+		defer func() {
+			worker.mu.Lock()
+			reloading.busy, reloading.resetting = false, false
+			worker.notifyChats()
+			worker.mu.Unlock()
+		}()
+	}
 	worker.mu.Unlock()
 	if busy {
 		opened, err := worker.openTab(ctx)
@@ -564,8 +579,8 @@ func (worker *Worker) Proof(ctx context.Context, digest string, prompt string) (
 		if result["type"] != "null" {
 			value, _ := result["value"].(string)
 			var page struct {
-				Proof   string  `json:"proof"`
-				Compute float64 `json:"compute"`
+				Proof string `json:"proof"`
+				pageProofTiming
 			}
 			if err := json.Unmarshal([]byte(value), &page); err != nil {
 				return "", fmt.Errorf("解析 fresh WAA proof: %w", err)
@@ -573,9 +588,7 @@ func (worker *Worker) Proof(ctx context.Context, digest string, prompt string) (
 			if !strings.HasPrefix(page.Proof, "!") {
 				return "", errors.New("fresh WAA proof 前缀无效")
 			}
-			compute := time.Duration(page.Compute * float64(time.Millisecond))
-			prooftime.Observe(ctx, prooftime.Compute, compute)
-			prooftime.Observe(ctx, prooftime.Interaction, time.Since(locked)-compute)
+			page.observe(ctx, locked)
 			return page.Proof, nil
 		}
 		if time.Now().After(deadline) {
@@ -849,11 +862,11 @@ func (worker *Worker) openPage(ctx context.Context, options Options, contextID s
 		"context": contextID,
 		"url":     target,
 		"wait":    "interactive",
-	}); err != nil && !strings.Contains(err.Error(), "NS_ERROR_ABORT") {
+	}); err != nil && !commandErrorContains(err, "NS_ERROR_ABORT") {
 		if cause := context.Cause(pageCtx); errors.Is(cause, ErrProxyUnreachable) {
 			return loadedPage{}, cause
 		}
-		if strings.Contains(err.Error(), "NS_ERROR_PROXY_") {
+		if commandErrorContains(err, "NS_ERROR_PROXY_") {
 			return loadedPage{}, fmt.Errorf("%w: 导航 AI Studio: %v", ErrProxyUnreachable, err)
 		}
 		return loadedPage{}, fmt.Errorf("导航 AI Studio: %w", err)

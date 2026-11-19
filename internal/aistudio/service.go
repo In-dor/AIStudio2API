@@ -122,14 +122,9 @@ func (t *WorkerProtectedTransport) DoProtected(ctx context.Context, request Gene
 	}
 	var prompt string
 	var promptHash string
-	proofField := 5
 	switch rpc.Method {
 	case buildProxyStreamedMethod, buildProxyUnaryMethod:
 		prompt, err = buildBindingPrompt(rpc.Body)
-		proofField = buildProofField
-	case assistantOfflineMethod:
-		proofField = assistantProofField
-		fallthrough
 	default:
 		promptHash, err = bindingPromptHash(GenerateRequest{Contents: contents})
 	}
@@ -148,22 +143,24 @@ func (t *WorkerProtectedTransport) DoProtected(ctx context.Context, request Gene
 		ctx = context.WithValue(ctx, pageRerunKey{}, rounds)
 	}
 	modelID := strings.TrimPrefix(strings.TrimSpace(request.Model), "models/")
-	return t.doPreparedWithHash(ctx, prompt, promptHash, page, proofField, request.continuationProof, AccountSelection{
+	if rpc.Method == "GenerateContent" {
+		ctx = context.WithValue(ctx, pageModelKey{}, modelID)
+	}
+	return t.doPreparedWithHash(ctx, prompt, promptHash, page, request.continuationProof, AccountSelection{
 		ModelID: modelID, Method: "generateContent", AccountID: strings.TrimSpace(request.AccountID),
 	}, rpc)
 }
 
-// doPrepared 为请求写入 proof 后经账户的 WAA 运行时发送，并写回运行时导出的 Cookie；proof 非空时写入该 proof
+// doPrepared 为请求取得 proof 后经账户的 WAA 运行时发送，proof 写在 rpc.ProofAt 处，并写回运行时导出的 Cookie；proof 非空时写入该 proof
 func (t *WorkerProtectedTransport) doPrepared(
 	ctx context.Context,
 	prompt string,
 	page string,
-	proofField int,
 	proof string,
 	selection AccountSelection,
 	rpc RPCRequest,
 ) (*RPCResponse, error) {
-	return t.doPreparedWithHash(ctx, prompt, "", page, proofField, proof, selection, rpc)
+	return t.doPreparedWithHash(ctx, prompt, "", page, proof, selection, rpc)
 }
 
 func (t *WorkerProtectedTransport) doPreparedWithHash(
@@ -171,12 +168,11 @@ func (t *WorkerProtectedTransport) doPreparedWithHash(
 	prompt string,
 	promptHash string,
 	page string,
-	proofField int,
 	proof string,
 	selection AccountSelection,
 	rpc RPCRequest,
 ) (*RPCResponse, error) {
-	lease, worker, rpc, prepared, err := t.prepareProtectedRequestWithHash(ctx, prompt, promptHash, page, proofField, proof, selection, rpc)
+	lease, worker, rpc, prepared, err := t.prepareProtectedRequestWithHash(ctx, prompt, promptHash, page, proof, selection, rpc)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +191,7 @@ func (t *WorkerProtectedTransport) doPreparedWithHash(
 	}
 	reportRequestPhase(ctx, RequestPhaseSendingUpstream)
 	response, err := worker.SendProtected(ctx, ProtectedRequest{
-		URL: rpc.URL, Headers: headers, Body: rpc.Body, Prompt: prompt, PromptHash: promptHash, PagePrompt: prepared.PagePrompt, ProofField: proofField, Proof: prepared.Proof,
+		URL: rpc.URL, Headers: headers, Body: rpc.Body, ProofAt: rpc.ProofAt, Prompt: prompt, PromptHash: promptHash, PagePrompt: prepared.PagePrompt, Proof: prepared.Proof,
 	})
 	if err != nil {
 		return nil, err
@@ -235,12 +231,11 @@ func (t *WorkerProtectedTransport) prepareProtectedRequest(
 	ctx context.Context,
 	prompt string,
 	page string,
-	proofField int,
 	proof string,
 	selection AccountSelection,
 	rpc RPCRequest,
 ) (*AccountLease, ProtectedPreparer, RPCRequest, PreparedProtectedRequest, error) {
-	return t.prepareProtectedRequestWithHash(ctx, prompt, "", page, proofField, proof, selection, rpc)
+	return t.prepareProtectedRequestWithHash(ctx, prompt, "", page, proof, selection, rpc)
 }
 
 func (t *WorkerProtectedTransport) prepareProtectedRequestWithHash(
@@ -248,7 +243,6 @@ func (t *WorkerProtectedTransport) prepareProtectedRequestWithHash(
 	prompt string,
 	promptHash string,
 	page string,
-	proofField int,
 	proof string,
 	selection AccountSelection,
 	rpc RPCRequest,
@@ -266,8 +260,8 @@ func (t *WorkerProtectedTransport) prepareProtectedRequestWithHash(
 	}
 	reportRequestPhase(ctx, RequestPhasePreparingWAA)
 	prepared, err := worker.Prepare(ctx, ProtectedRequest{
-		URL: rpc.URL, Headers: rpc.Header.Clone(), Body: rpc.Body,
-		Prompt: prompt, PromptHash: promptHash, PagePrompt: page, ProofField: proofField, Proof: proof,
+		URL: rpc.URL, Headers: rpc.Header.Clone(), Body: rpc.Body, ProofAt: rpc.ProofAt,
+		Prompt: prompt, PromptHash: promptHash, PagePrompt: page, Proof: proof,
 	})
 	if err != nil {
 		return nil, nil, RPCRequest{}, PreparedProtectedRequest{}, fmt.Errorf("准备 fresh WAA proof: %w", err)
@@ -277,7 +271,6 @@ func (t *WorkerProtectedTransport) prepareProtectedRequestWithHash(
 	}
 	requestHeaders := rpc.Header
 	rpc.AccountID = lease.Account().ID
-	rpc.Body = prepared.Body
 	rpc.Header = prepared.Headers.Clone()
 	for name, values := range requestHeaders {
 		rpc.Header.Del(name)
@@ -291,7 +284,7 @@ func (t *WorkerProtectedTransport) prepareProtectedRequestWithHash(
 
 // DoProtectedTitle 写入 GenerateTitle fresh proof 后经 Worker 页面发送请求，binding 为提示词与回答以空格连接，页面输入框为空
 func (t *WorkerProtectedTransport) DoProtectedTitle(ctx context.Context, request TitleRequest, rpc RPCRequest) (*RPCResponse, error) {
-	return t.doPrepared(ctx, request.Prompt+" "+request.Answer, "", 3, "", AccountSelection{ModelID: request.Model}, rpc)
+	return t.doPrepared(ctx, request.Prompt+" "+request.Answer, "", "", AccountSelection{ModelID: request.Model}, rpc)
 }
 
 func bindingPrompt(request GenerateRequest) (string, error) {
@@ -480,7 +473,7 @@ type AccountRefresh struct {
 	Skipped        bool
 }
 
-// RefreshAccountState 重新载入账户页面读取权益与模型目录，登录失效时标记账户需要登录，因上游要求验证而受限的账户再发一次生成请求核对验证状态；wait 为 true 时等待该账户的一个普通槽位且不受调度状态限制，否则只用就绪账户的空闲槽位
+// RefreshAccountState 重新载入账户页面读取权益与模型目录，登录失效时标记账户需要登录，因上游要求验证而受限的账户在常驻 Worker 的页面上读取目录后再发一次生成请求核对验证状态；wait 为 true 时等待该账户的一个普通槽位且不受调度状态限制，否则只用就绪账户的空闲槽位
 func (s *PooledService) RefreshAccountState(ctx context.Context, accountID string, wait bool) (AccountRefresh, error) {
 	accountID = strings.TrimSpace(accountID)
 	if wait {
@@ -501,7 +494,11 @@ func (s *PooledService) RefreshAccountState(ctx context.Context, accountID strin
 	refresh := AccountRefresh{PreviousTier: account.BenefitTier, PreviousModels: len(account.Models)}
 	previous := slices.Clone(account.Models)
 	s.pool.mu.Unlock()
-	models, err := s.modelsForLease(ContextWithAccountLease(ctx, lease), lease, true)
+	catalogCtx := ctx
+	if s.pool.verificationRestricted(accountID) {
+		catalogCtx = ContextWithResidentCatalog(ctx)
+	}
+	models, err := s.modelsForLease(ContextWithAccountLease(catalogCtx, lease), lease, true)
 	if err == nil && s.pool.verificationRestricted(accountID) {
 		err = s.checkAccountVerification(ctx, lease)
 	}
@@ -516,24 +513,17 @@ func (s *PooledService) RefreshAccountState(ctx context.Context, accountID strin
 	return refresh, lease.Release()
 }
 
-// checkAccountVerification 以账户的页面初始化模型在租约内发一次最小生成请求：生成成功时解除受限，上游仍拒绝账户时按其原因保持服务受限，其他失败保持受限并返回该失败
+// checkAccountVerification 以账户的页面初始化模型在租约内发一次最小生成请求，第一次被上游 403、协议错误码 7 拒绝时与普通请求一样在同一账户重试一次：生成成功时解除受限，上游仍拒绝账户时按其原因保持服务受限，其他失败保持受限并返回该失败
 func (s *PooledService) checkAccountVerification(ctx context.Context, lease *AccountLease) error {
 	accountID := lease.Account().ID
 	model, err := s.pool.BootstrapModel(accountID)
 	if err != nil {
 		return err
 	}
-	events, err := s.Generate(ContextWithAccountLease(ctx, lease), GenerateRequest{
-		Model: model, AccountID: accountID, Contents: []Content{{Role: RoleUser, Parts: []Part{{Text: "Hi"}}}},
-	})
-	if err == nil {
-		for event := range events {
-			if event.Kind == EventError {
-				err = event.Err
-			}
-		}
-		if err == nil {
-			err = ctx.Err()
+	for attempt := 0; attempt < 2; attempt++ {
+		err = s.verificationGeneration(ctx, lease, model)
+		if _, rejected := AccountRejectionCooldown(err); !rejected {
+			break
 		}
 	}
 	if denial := RestrictionDenial(err); denial != nil {
@@ -543,6 +533,25 @@ func (s *PooledService) checkAccountVerification(ctx context.Context, lease *Acc
 		return err
 	}
 	return s.pool.clearRestriction(accountID)
+}
+
+// verificationGeneration 在租约内以 model 发一次最小生成请求并读完响应，返回生成或读取中的错误
+func (s *PooledService) verificationGeneration(ctx context.Context, lease *AccountLease, model string) error {
+	events, err := s.Generate(ContextWithAccountLease(ctx, lease), GenerateRequest{
+		Model: model, AccountID: lease.Account().ID, Contents: []Content{{Role: RoleUser, Parts: []Part{{Text: "Hi"}}}},
+	})
+	if err != nil {
+		return err
+	}
+	for event := range events {
+		if event.Kind == EventError {
+			err = event.Err
+		}
+	}
+	if err == nil {
+		err = ctx.Err()
+	}
+	return err
 }
 
 // CachedModels 返回启用账户最近同步目录的并集
@@ -851,7 +860,7 @@ func (s *PooledService) ValidateGenerateRequest(request GenerateRequest) error {
 	if len(request.Contents) == 0 {
 		return fmt.Errorf("%w: 请求没有系统提示或对话内容", ErrInvalidArgument)
 	}
-	request, _, err := prepareToolRequest(request)
+	request, _, err := prepareToolRequest(request, false)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}

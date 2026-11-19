@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -595,11 +596,12 @@ func TestUploadInlineMediaKeepImages(t *testing.T) {
 
 type mockPageUploaderRuntime struct {
 	workerRuntime
-	token         string
-	denied        bool
-	beforeCalled  int
-	inlinedFiles  []inlineFile
-	uploadedFiles []FileRef
+	token          string
+	denied         bool
+	beforeCalled   int
+	onBeforeUpload func()
+	inlinedFiles   []inlineFile
+	uploadedFiles  []FileRef
 }
 
 func (m *mockPageUploaderRuntime) driveDenied(_ context.Context) bool {
@@ -608,6 +610,9 @@ func (m *mockPageUploaderRuntime) driveDenied(_ context.Context) bool {
 
 func (m *mockPageUploaderRuntime) beforeUpload(_ context.Context, _ bool) string {
 	m.beforeCalled++
+	if m.onBeforeUpload != nil {
+		m.onBeforeUpload()
+	}
 	return m.token
 }
 
@@ -851,4 +856,137 @@ func TestUploadInlineMediaWithPageUploaderAndGetAppFolderNoAuth(t *testing.T) {
 			t.Errorf("expected 0 Drive uploads when driveDenied, got %d", uploadCount)
 		}
 	})
+}
+
+// TestUploadInlineMediaCanceledAfterBeforeUpload 验证 beforeUpload 返回后若 targetCtx 已取消，立即返回取消错误且不触发后台 prewarmInlineMediaAsync
+func TestUploadInlineMediaCanceledAfterBeforeUpload(t *testing.T) {
+	ctx := context.Background()
+	prewarmRPC := make(chan string, 4)
+	base := &testRPCTransport{
+		handler: func(req RPCRequest) (*RPCResponse, error) {
+			prewarmRPC <- req.Method
+			switch req.Method {
+			case "GenerateAccessToken":
+				return &RPCResponse{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{JSONProtobufContentType}},
+					Body:       io.NopCloser(strings.NewReader(`["mock-token"]`)),
+				}, nil
+			case "GetAppFolder":
+				return &RPCResponse{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{JSONProtobufContentType}},
+					Body:       io.NopCloser(strings.NewReader(`["mock-folder"]`)),
+				}, nil
+			}
+			return &RPCResponse{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{JSONProtobufContentType}},
+				Body:       io.NopCloser(strings.NewReader(`["ok"]`)),
+			}, nil
+		},
+	}
+	transport := &testDriveRPCTransport{testRPCTransport: base}
+	acc := &Account{
+		ID:      "acc-cancel-after-before",
+		Config:  AccountConfig{Enabled: true},
+		State:   AccountReady,
+		Models:  []Model{{ID: "gemini-2.5-flash", Methods: []string{"generateContent"}}},
+		runtime: accountRuntimeState{Resources: make(map[string]ResourceBinding)},
+	}
+	pool := NewAccountPool([]*Account{acc}, 2)
+	client := NewClient(ClientOptions{Transport: transport})
+	service := NewPooledService(pool, client)
+
+	reqCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	mockRuntime := &mockPageUploaderRuntime{
+		token:          "page-cached-token",
+		onBeforeUpload: cancel,
+	}
+	pageWorkers.Store(acc.ID, &NativeWorker{accountID: acc.ID, runtime: mockRuntime})
+	t.Cleanup(func() { pageWorkers.Delete(acc.ID) })
+
+	lease, err := pool.AcquireFor(ctx, AccountSelection{AccountID: acc.ID, anyState: true})
+	if err != nil {
+		t.Fatalf("AcquireFor failed: %v", err)
+	}
+	defer func() { _ = lease.Release() }()
+
+	// 小图片原本符合 Case 2 快速直传与后台预热条件；取消后必须被安全拦截
+	contents := []Content{
+		{
+			Role: RoleUser,
+			Parts: []Part{
+				{InlineData: &Blob{MIME: "image/png", Data: []byte("small-png-bytes")}, DisplayName: "small.png"},
+			},
+		},
+	}
+	rewritten, copies, err := service.UploadInlineMediaToLease(reqCtx, lease, contents, nil, false)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled error, got %v", err)
+	}
+	if rewritten != nil || copies != nil {
+		t.Fatalf("expected nil rewritten and copies on cancel, got rewritten=%v copies=%v", rewritten, copies)
+	}
+	if mockRuntime.beforeCalled != 1 {
+		t.Fatalf("expected beforeUpload called once, got %d", mockRuntime.beforeCalled)
+	}
+
+	select {
+	case method := <-prewarmRPC:
+		t.Fatalf("unexpected background prewarm RPC call after cancel: %s", method)
+	case <-time.After(50 * time.Millisecond):
+	}
+	transport.mu.Lock()
+	uploadCount := len(transport.uploads)
+	transport.mu.Unlock()
+	if uploadCount != 0 {
+		t.Fatalf("expected 0 background Drive uploads after cancel, got %d", uploadCount)
+	}
+}
+
+// TestProofDigestWithPromptHashAndProofAt 验证 ProtectedRequest 在 PromptHash + ProofAt 零拷贝方案下的摘要优先级与 proof 写入位置
+func TestProofDigestWithPromptHashAndProofAt(t *testing.T) {
+	body, proofAt, err := marshalWAAArray([]any{"models/gemini-2.5-flash", "payload", nil, "tail"}, 3)
+	if err != nil {
+		t.Fatalf("marshalWAAArray failed: %v", err)
+	}
+	hash, err := bindingPromptHash(GenerateRequest{
+		Contents: []Content{{Role: RoleUser, Parts: []Part{{Text: "hello waa"}}}},
+	})
+	if err != nil {
+		t.Fatalf("bindingPromptHash failed: %v", err)
+	}
+
+	// 1. PromptHash 生效且不依赖 Prompt 原文
+	req := ProtectedRequest{Body: body, ProofAt: proofAt, PromptHash: hash}
+	if got := proofDigest(req); got != hash {
+		t.Fatalf("proofDigest(PromptHash) = %q, want %q", got, hash)
+	}
+
+	// 2. Digest 优先级高于 PromptHash 与 Prompt
+	reqWithDigest := ProtectedRequest{Body: body, ProofAt: proofAt, Digest: "explicit-digest", PromptHash: hash, Prompt: "ignored"}
+	if got := proofDigest(reqWithDigest); got != "explicit-digest" {
+		t.Fatalf("proofDigest(Digest) = %q, want %q", got, "explicit-digest")
+	}
+
+	// 3. 无 Digest 与 PromptHash 时回退到 Prompt 的 SHA-256
+	promptReq := ProtectedRequest{Body: body, ProofAt: proofAt, Prompt: "hello waa"}
+	wantPromptDigest := fmt.Sprintf("%x", sha256.Sum256([]byte("hello waa")))
+	if got := proofDigest(promptReq); got != wantPromptDigest {
+		t.Fatalf("proofDigest(Prompt) = %q, want %q", got, wantPromptDigest)
+	}
+	if wantPromptDigest != hash {
+		t.Fatalf("PromptHash %q != sha256(Prompt) %q", hash, wantPromptDigest)
+	}
+
+	// 4. PreparedProtectedRequest.Payload() 在 ProofAt 处正确写入 proof
+	prepared := PreparedProtectedRequest{Body: body, ProofAt: proofAt, Proof: "test-proof-value"}
+	gotPayload := string(prepared.Payload())
+	wantPayload := `["models/gemini-2.5-flash","payload","test-proof-value","tail"]`
+	if gotPayload != wantPayload {
+		t.Fatalf("Payload() = %s, want %s", gotPayload, wantPayload)
+	}
 }

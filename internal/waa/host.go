@@ -622,12 +622,13 @@ func (state *agent) natives(realm *realmHost) map[string]hostNative {
 		natives["loadImage"] = hostNative{2, func(call *mozjs.Call) error {
 			address, id := call.ArgString(0), call.ArgNumber(1)
 			state.pending++
+			issued, started := state.loop.now(), time.Now()
 			go func() {
 				loaded := state.loadImage(address)
-				state.loop.post(func() {
+				state.loop.push(&task{at: issued + milliseconds(time.Since(started)), job: func() {
 					state.dispatch(realm, id, mozjs.Bool(loaded))
 					state.loaded()
-				})
+				}})
 			}()
 			return nil
 		}}
@@ -636,12 +637,13 @@ func (state *agent) natives(realm *realmHost) map[string]hostNative {
 		natives["loadFrame"] = hostNative{2, func(call *mozjs.Call) error {
 			address, id := call.ArgString(0), call.ArgNumber(1)
 			state.pending++
+			issued, started := state.loop.now(), time.Now()
 			go func() {
 				loaded := state.loadFrame(address)
-				state.loop.post(func() {
+				state.loop.push(&task{at: issued + milliseconds(time.Since(started)), job: func() {
 					state.dispatch(realm, id, mozjs.Bool(loaded))
 					state.loaded()
-				})
+				}})
 			}()
 			return nil
 		}}

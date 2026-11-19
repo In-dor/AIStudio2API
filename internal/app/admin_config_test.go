@@ -72,3 +72,62 @@ func TestAdminConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestAdminConfigIgnoreThoughtSignatureImmediate 验证修改 IgnoreThoughtSignature 立即生效且不需要重启生成服务
+func TestAdminConfigIgnoreThoughtSignatureImmediate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".env")
+	cfg := config.Default()
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool := aistudio.NewAccountPool(nil, 1)
+	client := aistudio.NewClient(aistudio.ClientOptions{})
+	pooled := aistudio.NewPooledService(pool, client)
+	pooled.SetIgnoreThoughtSignature(cfg.IgnoreThoughtSignature)
+	service := &trackedService{pool: pool, service: pooled}
+	admin := &runtimeAdmin{configPath: path, requests: newRequestRegistry(ctx), pool: pool, service: service}
+	manager := &runtimeManager{activeManagement: cfg}
+
+	value, err := admin.RuntimeConfig(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !value.IgnoreThoughtSignature || !value.StripThoughtSignatures {
+		t.Fatalf("default ignore_thought_signature=%v strip_thought_signatures=%v, want both true", value.IgnoreThoughtSignature, value.StripThoughtSignatures)
+	}
+
+	value.IgnoreThoughtSignature = false
+	updated, err := admin.UpdateRuntimeConfig(ctx, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decorated := manager.decorateRuntimeConfig(updated, cfg)
+	if decorated.ServiceRestartRequired {
+		t.Fatalf("ServiceRestartRequired = true after changing IgnoreThoughtSignature, want false")
+	}
+	if decorated.ManagementRestartRequired {
+		t.Fatalf("ManagementRestartRequired = true after changing IgnoreThoughtSignature, want false")
+	}
+	if updated.IgnoreThoughtSignature || updated.StripThoughtSignatures {
+		t.Fatalf("updated ignore=%v strip=%v, want both false", updated.IgnoreThoughtSignature, updated.StripThoughtSignatures)
+	}
+	if pooled.IgnoreThoughtSignature || pooled.StripThoughtSignatures {
+		t.Fatalf("pooled ignore=%v strip=%v, want immediate false", pooled.IgnoreThoughtSignature, pooled.StripThoughtSignatures)
+	}
+
+	value = updated
+	value.IgnoreThoughtSignature = true
+	updated, err = admin.UpdateRuntimeConfig(ctx, value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decorated = manager.decorateRuntimeConfig(updated, cfg)
+	if decorated.ServiceRestartRequired {
+		t.Fatalf("ServiceRestartRequired = true after re-enabling IgnoreThoughtSignature, want false")
+	}
+	if !pooled.IgnoreThoughtSignature || !pooled.StripThoughtSignatures {
+		t.Fatalf("pooled ignore=%v strip=%v, want immediate true", pooled.IgnoreThoughtSignature, pooled.StripThoughtSignatures)
+	}
+}
