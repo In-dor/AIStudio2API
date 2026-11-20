@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	stdhttp "net/http"
+	"net/url"
 	"reflect"
 	"testing"
 	"time"
@@ -21,8 +22,8 @@ func TestBrowserRoundTripperFirefoxHTTP2(t *testing.T) {
 		t.Fatal(err)
 	}
 	transport := roundTripper.(*browserRoundTripper).transport
-	if transport.ReadIdleTimeout != 10*time.Second || transport.PingTimeout != 8*time.Second {
-		t.Fatalf("PING 阈值=%s 超时=%s，应为 10s 与 8s", transport.ReadIdleTimeout, transport.PingTimeout)
+	if transport.ReadIdleTimeout != 58*time.Second || transport.PingTimeout != 8*time.Second {
+		t.Fatalf("PING 阈值=%s 超时=%s，应为 58s 与 8s", transport.ReadIdleTimeout, transport.PingTimeout)
 	}
 	settings := map[http2.SettingID]uint32{http2.SettingHeaderTableSize: 65536, http2.SettingEnablePush: 0, http2.SettingInitialWindowSize: 131072, http2.SettingMaxFrameSize: 16384}
 	order := []http2.SettingID{http2.SettingHeaderTableSize, http2.SettingEnablePush, http2.SettingInitialWindowSize, http2.SettingMaxFrameSize}
@@ -85,9 +86,40 @@ func (r errReadCloser) Close() error {
 	return nil
 }
 
+func TestPoolAddress(t *testing.T) {
+	if got := poolAddress(nil); got != "" {
+		t.Fatalf("poolAddress(nil) = %q, want empty", got)
+	}
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{"https://alkalimakersuite-pa.clients6.google.com/$rpc/test", "alkalimakersuite-pa.clients6.google.com:443"},
+		{"http://example.com/path", "example.com:80"},
+		{"https://example.com:8443/path", "example.com:8443"},
+	}
+	for _, tc := range cases {
+		u, err := url.Parse(tc.raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := poolAddress(u); got != tc.want {
+			t.Errorf("poolAddress(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
 func TestBrowserResponseBodyAbnormalDisruption(t *testing.T) {
+	targetAddr := "alkalimakersuite-pa.clients6.google.com:443"
+	otherAddr := "waa-pa.clients6.google.com:443"
+	anonKey := poolKey(targetAddr, requestClass{anonymous: true})
+
 	pool := &firefoxConnPool{
-		conns:       map[string][]*http2.ClientConn{"test": nil},
+		conns: map[string][]*http2.ClientConn{
+			targetAddr: nil,
+			otherAddr:  nil,
+			anonKey:    nil,
+		},
 		experienced: map[*http2.ClientConn]bool{},
 		added:       make(chan struct{}),
 	}
@@ -96,6 +128,8 @@ func TestBrowserResponseBodyAbnormalDisruption(t *testing.T) {
 		source:  &fhttp.Response{},
 		trailer: stdhttp.Header{},
 		pool:    pool,
+		address: targetAddr,
+		class:   requestClass{},
 	}
 	buf := make([]byte, 16)
 	_, err := body.Read(buf)
@@ -103,15 +137,26 @@ func TestBrowserResponseBodyAbnormalDisruption(t *testing.T) {
 		t.Fatalf("expected ErrUnexpectedEOF, got %v", err)
 	}
 	pool.mu.Lock()
-	connsLen := len(pool.conns)
+	_, targetStillPresent := pool.conns[targetAddr]
+	_, otherStillPresent := pool.conns[otherAddr]
+	_, anonStillPresent := pool.conns[anonKey]
 	pool.mu.Unlock()
-	if connsLen != 0 {
-		t.Fatalf("expected pool to be shutdown and empty, but connsLen=%d", connsLen)
+	if targetStillPresent {
+		t.Fatalf("expected target host %q to be retired", targetAddr)
+	}
+	if !otherStillPresent {
+		t.Fatalf("expected unrelated host %q to remain in pool", otherAddr)
+	}
+	if !anonStillPresent {
+		t.Fatalf("expected anonymous class %q to remain in pool", anonKey)
 	}
 
-	// Normal EOF should not shutdown the pool
+	// Normal EOF should not retire any host key
 	pool = &firefoxConnPool{
-		conns:       map[string][]*http2.ClientConn{"test": nil},
+		conns: map[string][]*http2.ClientConn{
+			targetAddr: nil,
+			otherAddr:  nil,
+		},
 		experienced: map[*http2.ClientConn]bool{},
 		added:       make(chan struct{}),
 	}
@@ -120,15 +165,17 @@ func TestBrowserResponseBodyAbnormalDisruption(t *testing.T) {
 		source:  &fhttp.Response{},
 		trailer: stdhttp.Header{},
 		pool:    pool,
+		address: targetAddr,
+		class:   requestClass{},
 	}
 	_, err = body.Read(buf)
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("expected EOF, got %v", err)
 	}
 	pool.mu.Lock()
-	connsLen = len(pool.conns)
+	connsLen := len(pool.conns)
 	pool.mu.Unlock()
-	if connsLen != 1 {
-		t.Fatalf("expected pool to retain connection on EOF, but connsLen=%d", connsLen)
+	if connsLen != 2 {
+		t.Fatalf("expected pool to retain all connections on EOF, but connsLen=%d", connsLen)
 	}
 }
