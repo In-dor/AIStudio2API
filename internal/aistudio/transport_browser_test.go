@@ -178,4 +178,60 @@ func TestBrowserResponseBodyAbnormalDisruption(t *testing.T) {
 	if connsLen != 2 {
 		t.Fatalf("expected pool to retain all connections on EOF, but connsLen=%d", connsLen)
 	}
+
+	// Anonymous class abnormal disruption should retire only the anonymous key, preserving credentialed connections
+	pool = &firefoxConnPool{
+		conns: map[string][]*http2.ClientConn{
+			targetAddr: nil,
+			otherAddr:  nil,
+			anonKey:    nil,
+		},
+		experienced: map[*http2.ClientConn]bool{},
+		added:       make(chan struct{}),
+	}
+	body = &browserResponseBody{
+		body:    errReadCloser{err: io.ErrUnexpectedEOF},
+		source:  &fhttp.Response{},
+		trailer: stdhttp.Header{},
+		pool:    pool,
+		address: targetAddr,
+		class:   requestClass{anonymous: true},
+	}
+	_, err = body.Read(buf)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected ErrUnexpectedEOF for anonymous read, got %v", err)
+	}
+	pool.mu.Lock()
+	_, targetStillPresent = pool.conns[targetAddr]
+	_, otherStillPresent = pool.conns[otherAddr]
+	_, anonStillPresent = pool.conns[anonKey]
+	pool.mu.Unlock()
+	if !targetStillPresent {
+		t.Fatalf("expected credentialed host %q to remain when anonymous class retires", targetAddr)
+	}
+	if !otherStillPresent {
+		t.Fatalf("expected unrelated host %q to remain when anonymous class retires", otherAddr)
+	}
+	if anonStillPresent {
+		t.Fatalf("expected anonymous key %q to be retired", anonKey)
+	}
+}
+
+func TestBrowserResponseBodySyncTrailerNilSource(t *testing.T) {
+	body := &browserResponseBody{
+		body:    errReadCloser{err: io.EOF},
+		source:  nil,
+		trailer: stdhttp.Header{"X-Old": {"keep"}},
+	}
+	buf := make([]byte, 8)
+	if _, err := body.Read(buf); !errors.Is(err, io.EOF) {
+		t.Fatalf("expected io.EOF, got %v", err)
+	}
+	if err := body.Close(); err != nil {
+		t.Fatalf("unexpected Close error: %v", err)
+	}
+	body.syncTrailer()
+	if got := body.trailer.Get("X-Old"); got != "keep" {
+		t.Fatalf("expected trailer to remain untouched when source is nil, got %q", got)
+	}
 }

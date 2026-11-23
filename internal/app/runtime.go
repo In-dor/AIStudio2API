@@ -114,6 +114,7 @@ func newRuntime(
 	service.buildNativeNonstream = cfg.BuildNativeNonstream
 	service.hedgeAuto, service.hedgeAfter, _ = config.ParseFirstEventHedge(cfg.FirstEventHedge)
 	service.hedgeModels = config.ModelList(cfg.FirstEventHedgeModels)
+	service.firstEventTimeout, _ = config.ParseFirstEventTimeout(cfg.FirstEventTimeout)
 	service.discoverHiddenModels = cfg.DiscoverHiddenModels
 	mapping, _ := config.ParseModelMapping(cfg.ModelMapping)
 	service.SetRequestPolicy(mapping, cfg.MaxAccountSwitches)
@@ -181,6 +182,8 @@ type trackedService struct {
 	hedgeAfter time.Duration
 	// hedgeModels 是发起备用请求的模型
 	hedgeModels []string
+	// firstEventTimeout 是单次尝试从取得账户起等待首个上游事件的最长时间，零值表示不限制
+	firstEventTimeout time.Duration
 	// hedges 是正在进行的备用请求数
 	hedges atomic.Int32
 	// maxAccountSwitches 是一个请求因非额度失败换号的次数上限，保存设置后立即替换
@@ -797,13 +800,20 @@ func (service *trackedService) withAliases(models []aistudio.Model) []aistudio.M
 	return models
 }
 
-// mappedModel 返回 MODEL_MAPPING 中别名映射到的模型名，别名带思考后缀时该后缀替换目标自带的后缀，不是别名时原样返回
+// oneMillionContextSuffix 是 Claude Code 1M 上下文模式加在模型名末尾的标记，按去掉它的模型处理
+const oneMillionContextSuffix = "[1m]"
+
+// mappedModel 返回 MODEL_MAPPING 中别名映射到的模型名，别名带思考后缀时该后缀替换目标自带的后缀，不是别名时原样返回；完整名称不是别名时去掉末尾的 [1m] 再映射
 func (service *trackedService) mappedModel(name string) string {
-	trimmed := strings.TrimPrefix(strings.TrimSpace(name), "models/")
+	name = strings.TrimSpace(name)
+	trimmed := strings.TrimPrefix(name, "models/")
 	for _, alias := range service.aliases() {
 		if alias.Alias == trimmed {
 			return alias.Model
 		}
+	}
+	if strings.HasSuffix(strings.ToLower(trimmed), oneMillionContextSuffix) {
+		return service.mappedModel(name[:len(name)-len(oneMillionContextSuffix)])
 	}
 	open := strings.LastIndex(trimmed, "(")
 	if open <= 0 || !strings.HasSuffix(trimmed, ")") {
@@ -1043,6 +1053,25 @@ func (service *trackedService) syncAccountModels(ctx context.Context, accountID 
 	service.applyCachedModelCatalog()
 	service.modelSyncMu.Unlock()
 	return models, err
+}
+
+// verifyAccount 在服务生命周期中同步账户目录并发一次生成请求核对验证状态，刷新目录快照并发布状态
+func (service *trackedService) verifyAccount(ctx context.Context, accountID string) error {
+	requestCtx, cancel := service.lifecycleRequestContext(ctx)
+	defer cancel()
+	var err error
+	if verifier, ok := service.catalog.(interface {
+		VerifyAccount(context.Context, string) error
+	}); ok {
+		err = verifier.VerifyAccount(requestCtx, accountID)
+	} else {
+		_, err = service.refreshAccountModelCatalog(requestCtx, accountID, true)
+	}
+	service.modelSyncMu.Lock()
+	service.applyCachedModelCatalog()
+	service.modelSyncMu.Unlock()
+	service.publishModelAccess()
+	return err
 }
 
 // retryModelCatalogs 每 30 秒重新载入待同步账户的页面重试目录，自 startedAt 起每 24 小时重新载入启用账户的页面读取权益与目录；到期资源在启动时与每 10 分钟删除
@@ -1452,6 +1481,7 @@ func (service *trackedService) CountTokens(ctx context.Context, request aistudio
 		defer scheduleMemoryRelease()
 	}
 	count, requestErr := service.service.CountTokens(requestCtx, request)
+	requestErr = endedRequestError(requestCtx, requestErr)
 	api.SetAccessLogError(requestCtx, requestErr)
 	return count, requestErr
 }
@@ -1464,7 +1494,8 @@ func (service *trackedService) GenerateTitle(ctx context.Context, request aistud
 		return "", err
 	}
 	defer cancel()
-	return service.service.(aistudio.TitleService).GenerateTitle(requestCtx, request)
+	title, err := service.service.(aistudio.TitleService).GenerateTitle(requestCtx, request)
+	return title, endedRequestError(requestCtx, err)
 }
 
 // GenerateImage 生成 Imagen 图片并登记请求目标与账户
@@ -1476,6 +1507,7 @@ func (service *trackedService) GenerateImage(ctx context.Context, request aistud
 	}
 	defer cancel()
 	images, requestErr := service.service.(aistudio.ImageService).GenerateImage(requestCtx, request)
+	requestErr = endedRequestError(requestCtx, requestErr)
 	api.SetAccessLogError(requestCtx, requestErr)
 	return images, requestErr
 }
@@ -1489,6 +1521,7 @@ func (service *trackedService) CreateDecision(ctx context.Context, request aistu
 	}
 	defer cancel()
 	result, requestErr := service.service.(aistudio.DecisionService).CreateDecision(requestCtx, request)
+	requestErr = endedRequestError(requestCtx, requestErr)
 	api.SetAccessLogError(requestCtx, requestErr)
 	service.requests.log("service", "WARN", "Decision 请求使用 AI Studio 官网中隐藏的模型", "model", request.Model)
 	return result, requestErr
@@ -1506,6 +1539,7 @@ func (service *trackedService) GenerateVideo(ctx context.Context, request aistud
 	}
 	defer cancel()
 	if err := service.videoCooling(requestCtx, request); err != nil {
+		err = endedRequestError(requestCtx, err)
 		api.SetAccessLogError(requestCtx, err)
 		return aistudio.VideoOperation{}, err
 	}
@@ -1517,6 +1551,7 @@ func (service *trackedService) GenerateVideo(ctx context.Context, request aistud
 		return service.dataRequestContext(context.Background())
 	}
 	operation, requestErr := service.service.(aistudio.VideoService).GenerateVideo(requestCtx, request)
+	requestErr = endedRequestError(requestCtx, requestErr)
 	api.SetAccessLogError(requestCtx, requestErr)
 	return operation, requestErr
 }
@@ -1578,6 +1613,7 @@ func (service *trackedService) GetGenerateVideoOperation(ctx context.Context, op
 	}
 	defer cancel()
 	operation, requestErr := service.service.(aistudio.VideoService).GetGenerateVideoOperation(requestCtx, operationID)
+	requestErr = endedRequestError(requestCtx, requestErr)
 	api.SetAccessLogError(requestCtx, requestErr)
 	return operation, requestErr
 }
@@ -1590,6 +1626,7 @@ func (service *trackedService) ListVideos(ctx context.Context) ([]aistudio.Video
 	}
 	defer cancel()
 	videos, requestErr := service.service.(aistudio.VideoService).ListVideos(requestCtx)
+	requestErr = endedRequestError(requestCtx, requestErr)
 	api.SetAccessLogError(requestCtx, requestErr)
 	return videos, requestErr
 }
@@ -1602,6 +1639,7 @@ func (service *trackedService) DeleteVideo(ctx context.Context, operationID stri
 	}
 	defer cancel()
 	requestErr := service.service.(aistudio.VideoService).DeleteVideo(requestCtx, operationID)
+	requestErr = endedRequestError(requestCtx, requestErr)
 	api.SetAccessLogError(requestCtx, requestErr)
 	return requestErr
 }
@@ -1613,24 +1651,30 @@ func (service *trackedService) DownloadFile(ctx context.Context, fileID string) 
 		return aistudio.MediaStream{}, err
 	}
 	media, requestErr := service.service.(aistudio.VideoService).DownloadFile(requestCtx, fileID)
+	requestErr = endedRequestError(requestCtx, requestErr)
 	api.SetAccessLogError(requestCtx, requestErr)
 	if requestErr != nil {
 		cancel()
 		return aistudio.MediaStream{}, requestErr
 	}
-	media.Body = &trackedMediaReadCloser{body: media.Body, cancel: cancel}
+	media.Body = &trackedMediaReadCloser{body: media.Body, ctx: requestCtx, cancel: cancel}
 	return media, requestErr
 }
 
 type trackedMediaReadCloser struct {
 	body   io.ReadCloser
+	ctx    context.Context
 	cancel context.CancelFunc
 	once   sync.Once
 	err    error
 }
 
 func (closer *trackedMediaReadCloser) Read(target []byte) (int, error) {
-	return closer.body.Read(target)
+	read, err := closer.body.Read(target)
+	if err != io.EOF {
+		err = endedRequestError(closer.ctx, err)
+	}
+	return read, err
 }
 
 func (closer *trackedMediaReadCloser) Close() error {
@@ -1798,7 +1842,7 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 			}
 			failedWorkers[accountID] = struct{}{}
 			promoteFailure = promoteErr
-			if *failures++; int64(*failures) > service.maxAccountSwitches.Load() {
+			if !service.countSwitchFailure(failures, promoteErr) {
 				return nil, promotionFailure(service.pool, selection, promoteErr)
 			}
 			continue
@@ -2090,6 +2134,7 @@ func (service *trackedService) Generate(ctx context.Context, request aistudio.Ge
 	service.requests.start(request, cancel)
 	resourceID, err := service.pool.ResourceIDForContents(requestCtx, request.Contents)
 	if err != nil {
+		err = endedRequestError(requestCtx, err)
 		api.SetAccessLogError(requestCtx, err)
 		cancel()
 		service.requests.finish(request.ID, finalRequestState(err))
@@ -2117,12 +2162,16 @@ type generateAttempt struct {
 	firstAt          time.Time
 	err              error
 	cancel           context.CancelFunc
+	stopFirstEvent   func()
 	done             chan struct{}
 	uploadDone       chan struct{}
 	// serving 是正在生成回答的账户租约，续写轮换账户后为新账户的租约
 	serving atomic.Pointer[aistudio.AccountLease]
 	// failures 是请求已用掉的换号次数，续写轮换号在此基础上计数
 	failures int
+	// interactionStream 与 interactionTask 是租约账户与通道对该模型的 Interaction 路由
+	interactionStream bool
+	interactionTask   bool
 }
 
 // generateRetry 是生成请求跨尝试的换号与恢复状态
@@ -2191,7 +2240,7 @@ func (service *trackedService) generateWithRetry(
 		preferredAccountID = service.service.(aistudio.AssistantService).AssistantAccount(requestCtx, request)
 	}
 	inlineKeys := aistudio.ExtractInlineMediaKeys(request.Contents)
-	hedgeable := !request.Background && !assistant && !service.pool.InteractionAgentModel(modelID) && (service.hedgeAuto || service.hedgeAfter > 0) && slices.Contains(service.hedgeModels, modelID)
+	hedgeable := !request.Background && !assistant && (service.hedgeAuto || service.hedgeAfter > 0) && slices.Contains(service.hedgeModels, modelID)
 	hedged := false
 	var winner *generateAttempt
 	var activity *upstreamActivity
@@ -2285,6 +2334,7 @@ func (service *trackedService) generateWithRetry(
 			var ownerCooling *aistudio.AllCoolingError
 			if fileBound && !copyFiles && (errors.Is(acquireErr, aistudio.ErrNoEligibleAccount) || errors.As(acquireErr, &ownerCooling)) && requestCtx.Err() == nil {
 				copyFiles = true
+				retry.maxAttempts++
 				continue
 			}
 			var cooling *aistudio.AllCoolingError
@@ -2322,7 +2372,7 @@ func (service *trackedService) generateWithRetry(
 		service.requests.logRequestProgress(request.ID, accountLabel, "INFO", "等待上游响应")
 		primary := service.startAttempt(requestCtx, request, resourceID, modelID, fallbackReason, lease, selection, false, retry.failures)
 		var plan *hedgePlan
-		if hedgeable && !hedged {
+		if hedgeable && !primary.interactionTask && !hedged {
 			if delay, ok := service.hedgeDelay(modelID, string(lease.Channel())); ok {
 				fixed := resourceID != "" || requestedAccountID != "" || totalMediaBytes > aistudio.DirectInlineMediaMaxBytes
 				plan = &hedgePlan{delay: delay, selections: service.hedgeSelections(selection, lease.Account().ID, fixed, retry.attempted)}
@@ -2426,7 +2476,7 @@ func (service *trackedService) generateWithRetry(
 		if activity != nil {
 			api.SetAccessLogUpstreamBytes(requestCtx, activity.bytes.Load())
 		}
-		err = accountsUnavailable(err, retry.rejectionUntil)
+		err = accountsUnavailable(endedRequestError(requestCtx, err), retry.rejectionUntil)
 		api.SetAccessLogError(requestCtx, err)
 		service.requests.finish(request.ID, finalRequestState(err))
 		select {
@@ -2480,15 +2530,35 @@ func (service *trackedService) startAttempt(
 ) *generateAttempt {
 	unbound := strings.TrimSpace(request.AccountID) == "" && resourceID == ""
 	request.AccountID = lease.Account().ID
+	interactionStream, interactionTask := lease.InteractionRoute(modelID)
 	attempt := &generateAttempt{
 		lease: lease, selection: selection, hedge: hedge, unbound: unbound, accountLabel: lease.Account().Config.Label,
 		proxy: service.proxies.Binding(request.AccountID), workerGeneration: service.workers.WorkerGeneration(request.AccountID),
 		startedAt: time.Now(), activity: &upstreamActivity{}, done: make(chan struct{}),
 		uploadDone: make(chan struct{}), failures: failures,
+		interactionStream: interactionStream, interactionTask: interactionTask,
 	}
 	attempt.serving.Store(lease)
-	attemptCtx, cancel := context.WithCancel(requestCtx)
-	attempt.cancel = cancel
+	attemptCtx, cancel := context.WithCancelCause(requestCtx)
+	attempt.cancel = func() { cancel(context.Canceled) }
+	if service.firstEventTimeout > 0 && !request.Background && !attempt.interactionTask {
+		timeout := service.firstEventTimeout
+		var mu sync.Mutex
+		stopped := false
+		timer := time.AfterFunc(timeout, func() {
+			mu.Lock()
+			defer mu.Unlock()
+			if !stopped {
+				cancel(&firstEventTimeoutError{timeout: timeout})
+			}
+		})
+		attempt.stopFirstEvent = func() {
+			mu.Lock()
+			stopped = true
+			timer.Stop()
+			mu.Unlock()
+		}
+	}
 	go func() {
 		defer close(attempt.done)
 		service.runAttempt(attemptCtx, request, resourceID, modelID, fallbackReason, attempt)
@@ -2514,18 +2584,13 @@ func (service *trackedService) runAttempt(
 		})
 	}
 	defer closeUploadDone()
-
+	if attempt.stopFirstEvent != nil {
+		defer attempt.stopFirstEvent()
+	}
 	lease, accountLabel := attempt.lease, attempt.accountLabel
-	inlineImages := false
-	for _, model := range service.modelSnapshot() {
-		if model.ID != modelID {
-			continue
-		}
-		if model.Capabilities["interaction_task"] {
-			// agent 后台任务只发送 AgentInput 选出的内容，其余轮次的文件不复制、附件不上传
-			request.Contents = aistudio.AgentInput(request.Contents, request.PreviousInteractionID != "")
-		}
-		inlineImages = model.Capabilities["interaction_stream"]
+	if attempt.interactionTask {
+		// agent 后台任务只发送 AgentInput 选出的内容，其余轮次的文件不复制、附件不上传
+		request.Contents = aistudio.AgentInput(request.Contents, request.PreviousInteractionID != "")
 	}
 	originalContents := request.Contents
 	ctx = aistudio.ContextWithAccountLease(ctx, lease)
@@ -2551,7 +2616,7 @@ func (service *trackedService) runAttempt(
 		uploadStartedAt := time.Now()
 		request.Contents, attempt.copies, err = service.service.(interface {
 			UploadInlineMediaToLease(context.Context, *aistudio.AccountLease, []aistudio.Content, *aistudio.TemporaryFileCopies, bool) ([]aistudio.Content, *aistudio.TemporaryFileCopies, error)
-		}).UploadInlineMediaToLease(ctx, lease, request.Contents, attempt.copies, inlineImages)
+		}).UploadInlineMediaToLease(ctx, lease, request.Contents, attempt.copies, attempt.interactionStream)
 		if err == nil {
 			service.requests.logRequestProgress(request.ID, accountLabel, "INFO", "内联附件处理完成",
 				"attachments", mediaCount, "bytes", aistudio.FormatBytes(mediaBytes), "duration", time.Since(uploadStartedAt))
@@ -2565,6 +2630,12 @@ func (service *trackedService) runAttempt(
 		service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "请求准备等待", "waited", waited, "current_step", current, "model", modelID)
 	})
 	ctx = aistudio.ContextWithStreamActivityObserver(ctx, attempt.activity.observe)
+	ctx = aistudio.ContextWithRegenerationObserver(ctx, func(regenerated int, reason string) {
+		service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "重新生成", "attempt", regenerated, "model", modelID, "reason", reason)
+	})
+	ctx = aistudio.ContextWithReplyToolBypassObserver(ctx, func() {
+		service.requests.logRequestProgress(request.ID, accountLabel, "INFO", "模型没有使用回复工具", "model", modelID)
+	})
 	ctx = aistudio.ContextWithRequestPhaseObserver(ctx, prepareTiming.observe)
 	if err == nil {
 		attempt.source, err = service.service.Generate(ctx, request)
@@ -2596,6 +2667,21 @@ func (service *trackedService) runAttempt(
 		if firstEventDelayed && err == nil {
 			service.requests.logRequestProgress(request.ID, accountLabel, "INFO", "上游首事件到达",
 				"waited", time.Since(upstreamStartedAt), "first_event", attempt.first.Kind, "model", modelID)
+		}
+	}
+	if attempt.stopFirstEvent != nil {
+		attempt.stopFirstEvent()
+	}
+	var timedOut *firstEventTimeoutError
+	if errors.As(context.Cause(ctx), &timedOut) {
+		var rpcErr *aistudio.RPCError
+		if err == nil || !errors.As(err, &rpcErr) {
+			if err == nil && attempt.source != nil {
+				for range attempt.source {
+				}
+				attempt.source = nil
+			}
+			err = timedOut
 		}
 	}
 	attempt.err = err
@@ -2645,10 +2731,8 @@ func (service *trackedService) continuationAccount(ctx context.Context, requestI
 	if releaseErr := current.Release(); releaseErr != nil {
 		return nil, releaseErr
 	}
-	if !quota && !errors.Is(err, aistudio.ErrAccountCoolingDown) {
-		if attempt.failures++; int64(attempt.failures) > service.maxAccountSwitches.Load() {
-			return nil, aistudio.ErrNoEligibleAccount
-		}
+	if !service.countSwitchFailure(&attempt.failures, err) {
+		return nil, aistudio.ErrNoEligibleAccount
 	}
 	selection := aistudio.AccountSelection{ModelID: modelID, Method: "generateContent", PlaygroundOnly: true, AllowedAccountIDs: []string{}}
 	for _, accountID := range service.pool.EnabledAccounts() {
@@ -2903,8 +2987,9 @@ func (service *trackedService) settleAttempt(
 	}
 	service.workers.spareForCooling(requestCtx, attempt.selection, accountID, cooledUntil)
 	recoverWorker := false
-	// 上游以额度、权限拒绝或服务受限拒绝账户时不重建 Worker 重放，直接换号
-	if requestCtx.Err() == nil && mayRecover && !quotaFailure && !rejected && denial == nil {
+	var firstEventTimedOut *firstEventTimeoutError
+	// 上游以额度、权限拒绝、服务受限或首字超时结束尝试时不重建 Worker 重放，直接换号
+	if requestCtx.Err() == nil && mayRecover && !quotaFailure && !rejected && denial == nil && !errors.As(err, &firstEventTimedOut) {
 		var resetErr error
 		recoverWorker, _, resetErr = service.recoverWorkerOnce(
 			requestCtx, accountID, workerGeneration, retry.recoveredWorker,
@@ -2916,11 +3001,22 @@ func (service *trackedService) settleAttempt(
 			retryable = false
 		}
 	}
-	if retryable && !quotaFailure && !buildRejected && !missingInlineMedia && !recoverWorker && !coolingDown {
-		retry.failures++
-		retryable = int64(retry.failures) <= service.maxAccountSwitches.Load()
+	if retryable && !buildRejected && !missingInlineMedia && !recoverWorker {
+		retryable = service.countSwitchFailure(&retry.failures, err)
 	}
 	return attemptOutcome{err: err, retryable: retryable, recoverWorker: recoverWorker, accountID: accountID, accountLabel: accountLabel}
+}
+
+// countSwitchFailure 判断 err 引起的换号是否计入 MAX_ACCOUNT_SWITCHES，返回是否仍在换号上限内；登录失效、发送前进入冷却与额度失败不计入
+func (service *trackedService) countSwitchFailure(failures *int, err error) bool {
+	if aistudio.DefinitiveAuthenticationFailure(err) || errors.Is(err, aistudio.ErrAccountCoolingDown) {
+		return true
+	}
+	if _, quota := aistudio.QuotaCooldownForError(err, time.Now()); quota {
+		return true
+	}
+	*failures++
+	return int64(*failures) <= service.maxAccountSwitches.Load()
 }
 
 // rejectedBuildAttempt 表示 Build 以参数错误拒绝、改由 Playground 重试的尝试
@@ -3028,6 +3124,10 @@ func retryableGenerateAccountError(ctx context.Context, err error) bool {
 	if errors.As(err, &interrupted) {
 		return ctx.Err() == nil
 	}
+	var readError *aistudio.ResponseReadError
+	if errors.As(err, &readError) {
+		return ctx.Err() == nil
+	}
 	var workerInitError *accountWorkerInitError
 	if errors.As(err, &workerInitError) {
 		return ctx.Err() == nil
@@ -3056,84 +3156,147 @@ func (service *trackedService) lifecycleRequestContext(ctx context.Context) (con
 	}
 }
 
-// dataRequestContext 返回绑定数据面生命周期、期限为 REQUEST_TIMEOUT 的请求上下文，自动续写每开始一轮期限重新计时
+// dataRequestContext 返回绑定数据面生命周期的请求上下文，上游连续 REQUEST_TIMEOUT 没有数据时到期
 func (service *trackedService) dataRequestContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
 	service.lifecycleMu.Lock()
 	if service.state.Load() != serviceRunning || service.dataContext == nil {
 		service.lifecycleMu.Unlock()
 		return nil, nil, service.stoppedError()
 	}
-	deadline, cancel := newRoundDeadlineContext(ctx, service.timeout)
+	deadline, cancel := newIdleDeadlineContext(ctx, service.timeout)
 	run := service.dataContext
 	stopData := context.AfterFunc(run, cancel)
 	service.lifecycleMu.Unlock()
-	return aistudio.ContextWithServiceRun(aistudio.ContextWithContinuationObserver(deadline, deadline.extend), run), func() {
+	return aistudio.ContextWithServiceRun(aistudio.ContextWithStreamActivityObserver(deadline, deadline.observe), run), func() {
 		stopData()
 		cancel()
 	}, nil
 }
 
-// roundDeadlineContext 是期限可在自动续写每轮开始时重新计时的请求上下文，到期时 Err 为 context.DeadlineExceeded
-type roundDeadlineContext struct {
-	parent   context.Context
-	timeout  time.Duration
-	done     chan struct{}
-	mu       sync.Mutex
-	timer    *time.Timer
-	stop     func() bool
-	deadline time.Time
-	err      error
+// endedRequestError 在请求所属的生成服务已停止或上游连续没有数据超过 REQUEST_TIMEOUT 时把非空的 err 换成说明原因的错误，其余原样返回 err
+func endedRequestError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if aistudio.ServiceStopped(ctx) {
+		return &serviceStoppedError{}
+	}
+	if deadline, ok := ctx.Value(idleDeadlineKey{}).(*idleDeadlineContext); ok {
+		deadline.mu.Lock()
+		cause := deadline.cause
+		deadline.mu.Unlock()
+		if cause != nil {
+			return cause
+		}
+	}
+	return err
 }
 
-// newRoundDeadlineContext 返回期限为 timeout、随 parent 结束的请求上下文
-func newRoundDeadlineContext(parent context.Context, timeout time.Duration) (*roundDeadlineContext, context.CancelFunc) {
-	ctx := &roundDeadlineContext{parent: parent, timeout: timeout, done: make(chan struct{}), deadline: time.Now().Add(timeout)}
+// idleDeadlineContext 是上游连续 timeout 没有数据时到期的请求上下文，请求开始到首个字节同样计入，到期时 Err 为 context.DeadlineExceeded
+// 约束：active 为最近一次收到上游数据距 started 的纳秒数，由读取上游响应的 goroutine 并发写入
+type idleDeadlineContext struct {
+	parent  context.Context
+	timeout time.Duration
+	started time.Time
+	active  atomic.Int64
+	done    chan struct{}
+	mu      sync.Mutex
+	timer   *time.Timer
+	stop    func() bool
+	err     error
+	// cause 是上游连续没有数据超过 REQUEST_TIMEOUT 时说明原因的错误，其余结束方式为 nil
+	cause error
+}
+
+type idleDeadlineKey struct{}
+
+// upstreamIdleError 是上游连续 REQUEST_TIMEOUT 没有数据时请求的结束原因
+type upstreamIdleError struct {
+	timeout time.Duration
+}
+
+func (e *upstreamIdleError) Error() string {
+	return fmt.Sprintf("上游连续 %s 没有数据，超过 REQUEST_TIMEOUT", e.timeout)
+}
+
+func (e *upstreamIdleError) Is(target error) bool {
+	return target == context.DeadlineExceeded
+}
+
+// firstEventTimeoutError 是单次尝试在 FIRST_EVENT_TIMEOUT 内没有收到首个上游事件的失败原因
+type firstEventTimeoutError struct {
+	timeout time.Duration
+}
+
+func (e *firstEventTimeoutError) Error() string {
+	return fmt.Sprintf("上游 %s 没有返回首个事件，超过 FIRST_EVENT_TIMEOUT", e.timeout)
+}
+
+func (e *firstEventTimeoutError) Is(target error) bool {
+	return target == context.DeadlineExceeded
+}
+
+// newIdleDeadlineContext 返回上游连续 timeout 没有数据时到期、随 parent 结束的请求上下文
+func newIdleDeadlineContext(parent context.Context, timeout time.Duration) (*idleDeadlineContext, context.CancelFunc) {
+	ctx := &idleDeadlineContext{parent: parent, timeout: timeout, started: time.Now(), done: make(chan struct{})}
 	ctx.mu.Lock()
-	ctx.timer = time.AfterFunc(timeout, func() { ctx.finish(context.DeadlineExceeded) })
-	ctx.stop = context.AfterFunc(parent, func() { ctx.finish(parent.Err()) })
+	ctx.timer = time.AfterFunc(timeout, ctx.expire)
+	ctx.stop = context.AfterFunc(parent, func() { ctx.finish(parent.Err(), nil) })
 	ctx.mu.Unlock()
-	return ctx, func() { ctx.finish(context.Canceled) }
+	return ctx, func() { ctx.finish(context.Canceled, nil) }
 }
 
-func (ctx *roundDeadlineContext) finish(err error) {
+// observe 记录收到上游数据的时刻
+func (ctx *idleDeadlineContext) observe(int) {
+	ctx.active.Store(int64(time.Since(ctx.started)))
+}
+
+// expire 在计时到达时结束请求，计时期间收到过上游数据时改为从最近一次数据起再计 timeout
+func (ctx *idleDeadlineContext) expire() {
+	remaining := time.Duration(ctx.active.Load()) + ctx.timeout - time.Since(ctx.started)
+	if remaining <= 0 {
+		ctx.finish(context.DeadlineExceeded, &upstreamIdleError{timeout: ctx.timeout})
+		return
+	}
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+	if ctx.err == nil {
+		ctx.timer.Reset(remaining)
+	}
+}
+
+// finish 以 err 结束请求上下文，cause 为说明原因的错误
+func (ctx *idleDeadlineContext) finish(err error, cause error) {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
 	if ctx.err != nil {
 		return
 	}
-	ctx.err = err
+	ctx.err, ctx.cause = err, cause
 	ctx.timer.Stop()
 	ctx.stop()
 	close(ctx.done)
 }
 
-// extend 把期限重新计为 timeout
-func (ctx *roundDeadlineContext) extend() {
-	ctx.mu.Lock()
-	defer ctx.mu.Unlock()
-	if ctx.err == nil {
-		ctx.deadline = time.Now().Add(ctx.timeout)
-		ctx.timer.Reset(ctx.timeout)
-	}
+// Deadline 返回最近一次收到上游数据之后 timeout 的时刻
+func (ctx *idleDeadlineContext) Deadline() (time.Time, bool) {
+	return ctx.started.Add(time.Duration(ctx.active.Load()) + ctx.timeout), true
 }
 
-func (ctx *roundDeadlineContext) Deadline() (time.Time, bool) {
-	ctx.mu.Lock()
-	defer ctx.mu.Unlock()
-	return ctx.deadline, true
-}
-
-func (ctx *roundDeadlineContext) Done() <-chan struct{} {
+func (ctx *idleDeadlineContext) Done() <-chan struct{} {
 	return ctx.done
 }
 
-func (ctx *roundDeadlineContext) Err() error {
+func (ctx *idleDeadlineContext) Err() error {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
 	return ctx.err
 }
 
-func (ctx *roundDeadlineContext) Value(key any) any {
+func (ctx *idleDeadlineContext) Value(key any) any {
+	if key == (idleDeadlineKey{}) {
+		return ctx
+	}
 	return ctx.parent.Value(key)
 }
 
@@ -3168,7 +3331,7 @@ func (service *trackedService) forwardEvents(
 	defer stallTimer.Stop()
 	var stall <-chan time.Time
 	finishFromContext := func() {
-		requestErr = requestCtx.Err()
+		requestErr = endedRequestError(requestCtx, requestCtx.Err())
 		state = finalRequestState(requestErr)
 		if requestErr == nil || terminal || clientCtx.Err() != nil {
 			return
@@ -3286,6 +3449,7 @@ func (service *trackedService) forwardEvents(
 			continue
 		}
 		if event.Kind == aistudio.EventError {
+			event.Err = endedRequestError(requestCtx, event.Err)
 			event.Err = service.settleStreamError(requestCtx, requestID, requestedModelID, serving.Load(), event.Err)
 			requestErr = event.Err
 			state = finalRequestState(event.Err)

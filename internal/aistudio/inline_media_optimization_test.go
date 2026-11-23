@@ -990,3 +990,185 @@ func TestProofDigestWithPromptHashAndProofAt(t *testing.T) {
 		t.Fatalf("Payload() = %s, want %s", gotPayload, wantPayload)
 	}
 }
+
+// TestInlineMediaHitAndAccountFilterStatesAndExpiry 验证 HasInlineMediaHit 与 InlineMediaAccount 跳过停用/受限/需重登账户及过期绑定
+func TestInlineMediaHitAndAccountFilterStatesAndExpiry(t *testing.T) {
+	now := time.Now().UTC()
+	blob1 := NewBlob("image/png", []byte("filter-state-image-1"))
+	blob2 := NewBlob("image/png", []byte("filter-state-image-2"))
+	contents := []Content{
+		{
+			Role: RoleUser,
+			Parts: []Part{
+				{InlineData: blob1, DisplayName: "img1.png"},
+				{InlineData: blob2, DisplayName: "img2.png"},
+			},
+		},
+	}
+	keys := ExtractInlineMediaKeys(contents)
+	if len(keys) != 2 {
+		t.Fatalf("expected 2 keys, got %d", len(keys))
+	}
+
+	makeBinding := func(key InlineMediaKey, usedAt time.Time) ResourceBinding {
+		return ResourceBinding{
+			Kind:        "inline-media",
+			Name:        key.Name,
+			MIME:        key.MIME,
+			SHA256:      key.SHA256,
+			DisplayName: key.Name,
+			CreatedAt:   usedAt,
+			UsedAt:      usedAt,
+		}
+	}
+
+	fresh := now.Add(-10 * time.Minute)
+	expired := now.Add(-inlineMediaIdle)
+
+	disabledAcc := &Account{
+		ID:     "acc-disabled",
+		Config: AccountConfig{Enabled: false},
+		State:  AccountReady,
+		runtime: accountRuntimeState{Resources: map[string]ResourceBinding{
+			"file-d1": makeBinding(keys[0], fresh),
+			"file-d2": makeBinding(keys[1], fresh),
+		}},
+	}
+	restrictedAcc := &Account{
+		ID:     "acc-restricted",
+		Config: AccountConfig{Enabled: true},
+		State:  AccountRestricted,
+		runtime: accountRuntimeState{Resources: map[string]ResourceBinding{
+			"file-r1": makeBinding(keys[0], fresh),
+			"file-r2": makeBinding(keys[1], fresh),
+		}},
+	}
+	authRequiredAcc := &Account{
+		ID:     "acc-auth-required",
+		Config: AccountConfig{Enabled: true},
+		State:  AccountAuthRequired,
+		runtime: accountRuntimeState{Resources: map[string]ResourceBinding{
+			"file-a1": makeBinding(keys[0], fresh),
+			"file-a2": makeBinding(keys[1], fresh),
+		}},
+	}
+	expiredAcc := &Account{
+		ID:     "acc-expired",
+		Config: AccountConfig{Enabled: true},
+		State:  AccountReady,
+		runtime: accountRuntimeState{Resources: map[string]ResourceBinding{
+			"file-e1": makeBinding(keys[0], expired),
+			"file-e2": makeBinding(keys[1], expired),
+		}},
+	}
+	readyFreshAcc := &Account{
+		ID:     "acc-ready-fresh",
+		Config: AccountConfig{Enabled: true},
+		State:  AccountReady,
+		runtime: accountRuntimeState{Resources: map[string]ResourceBinding{
+			"file-ok1": makeBinding(keys[0], fresh),
+		}},
+	}
+
+	ineligibleOnly := NewAccountPool([]*Account{disabledAcc, restrictedAcc, authRequiredAcc, expiredAcc}, 2)
+	if got := ineligibleOnly.InlineMediaAccount(contents); got != "" {
+		t.Fatalf("InlineMediaAccount(ineligible/expired) = %q, want empty", got)
+	}
+	if ineligibleOnly.HasInlineMediaHit([]string{disabledAcc.ID, restrictedAcc.ID, authRequiredAcc.ID, expiredAcc.ID}, keys) {
+		t.Fatal("HasInlineMediaHit returned true for disabled/restricted/auth_required/expired accounts, want false")
+	}
+
+	mixed := NewAccountPool([]*Account{disabledAcc, restrictedAcc, authRequiredAcc, expiredAcc, readyFreshAcc}, 2)
+	if got := mixed.InlineMediaAccount(contents); got != readyFreshAcc.ID {
+		t.Fatalf("InlineMediaAccount(mixed) = %q, want %q", got, readyFreshAcc.ID)
+	}
+	if !mixed.HasInlineMediaHit([]string{disabledAcc.ID, readyFreshAcc.ID}, keys) {
+		t.Fatal("HasInlineMediaHit returned false when a ready account has a fresh hit, want true")
+	}
+}
+
+// TestAppFolderDriveNoAuthNegativeCache 验证 Client.appFolder 命中 driveNoAuth 负缓存短路，过期或失效后重新请求并清除负缓存
+func TestAppFolderDriveNoAuthNegativeCache(t *testing.T) {
+	ctx := context.Background()
+	var calls int
+	var deny bool
+	deny = true
+
+	transport := &testRPCTransport{
+		handler: func(req RPCRequest) (*RPCResponse, error) {
+			calls++
+			if deny {
+				return nil, &RPCError{
+					Method:     req.Method,
+					StatusCode: http.StatusUnauthorized,
+					Code:       16,
+					Message:    "OAuth error: unauthorized_client.",
+				}
+			}
+			return &RPCResponse{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{JSONProtobufContentType}},
+				Body:       io.NopCloser(strings.NewReader(`["folder-123"]`)),
+			}, nil
+		},
+	}
+	client := NewClient(ClientOptions{Transport: transport})
+	const accID = "acc-drive-noauth"
+
+	// 1. 首次 GetAppFolder 返回 unauthorized_client 后写入 driveNoAuth 负缓存
+	if _, err := client.appFolder(ctx, accID); !driveAuthorizationMissing(err) {
+		t.Fatalf("first appFolder err = %v, want driveAuthorizationMissing", err)
+	}
+	if calls != 1 {
+		t.Fatalf("RPC calls after first appFolder = %d, want 1", calls)
+	}
+
+	// 2. 第二次调用命中 driveNoAuth 负缓存短路，不再发 RPC
+	if _, err := client.appFolder(ctx, accID); !driveAuthorizationMissing(err) {
+		t.Fatalf("cached appFolder err = %v, want driveAuthorizationMissing", err)
+	} else {
+		var rpcErr *RPCError
+		if !errors.As(err, &rpcErr) || rpcErr.Method != "GetAppFolder" || rpcErr.StatusCode != http.StatusUnauthorized || rpcErr.Code != 16 {
+			t.Fatalf("cached appFolder rpcErr = %+v, want GetAppFolder 401 code 16", rpcErr)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("RPC calls after negative-cached appFolder = %d, want 1", calls)
+	}
+
+	// 3. GenerateAccessToken 写入的 driveNoAuth 也能让 appFolder 直接短路
+	const accID2 = "acc-drive-noauth-from-token"
+	if _, err := client.GenerateAccessToken(ctx, accID2); !driveAuthorizationMissing(err) {
+		t.Fatalf("GenerateAccessToken err = %v, want driveAuthorizationMissing", err)
+	}
+	callsAfterToken := calls
+	if _, err := client.appFolder(ctx, accID2); !driveAuthorizationMissing(err) {
+		t.Fatalf("appFolder after token noAuth err = %v, want driveAuthorizationMissing", err)
+	}
+	if calls != callsAfterToken {
+		t.Fatalf("appFolder should short-circuit on token driveNoAuth, calls = %d, want %d", calls, callsAfterToken)
+	}
+
+	// 4. 负缓存过期后重新请求成功，写入 appFolders 并删除 driveNoAuth
+	deny = false
+	client.driveCacheMu.Lock()
+	client.driveNoAuth[accID] = time.Now().Add(-time.Second)
+	client.driveCacheMu.Unlock()
+
+	folder, err := client.appFolder(ctx, accID)
+	if err != nil {
+		t.Fatalf("appFolder after negative cache expiry failed: %v", err)
+	}
+	if folder != "folder-123" {
+		t.Fatalf("folder = %q, want %q", folder, "folder-123")
+	}
+	if client.isDriveAuthMissing(accID) {
+		t.Fatal("expected driveNoAuth cleared after successful appFolder")
+	}
+	callsAfterSuccess := calls
+	// 5. 再次调用命中 appFolders 正缓存，不发 RPC
+	folder, err = client.appFolder(ctx, accID)
+	if err != nil || folder != "folder-123" || calls != callsAfterSuccess {
+		t.Fatalf("cached positive appFolder: folder=%q err=%v calls=%d want %d", folder, err, calls, callsAfterSuccess)
+	}
+}

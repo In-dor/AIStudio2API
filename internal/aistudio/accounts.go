@@ -26,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
 	appconfig "github.com/Mag1cFall/AIStudio2API/internal/config"
@@ -164,9 +165,24 @@ func accountStateReason(account *Account) string {
 	return reason
 }
 
+// MaxAccountNoteLength 是账户备注允许的最大字符数
+const MaxAccountNoteLength = 120
+
+// TruncateAccountNote 规范化账户备注：去掉首尾空白、折叠换行并在超过长度上限时按字符截断
+func TruncateAccountNote(note string) string {
+	cleaned := strings.Join(strings.FieldsFunc(strings.TrimSpace(note), func(r rune) bool {
+		return r == '\r' || r == '\n'
+	}), " ")
+	if utf8.RuneCountInString(cleaned) <= MaxAccountNoteLength {
+		return cleaned
+	}
+	return strings.TrimSpace(string([]rune(cleaned)[:MaxAccountNoteLength]))
+}
+
 // AccountConfig 表示账户目录中的固定最小配置
 type AccountConfig struct {
 	Label    string `json:"label"`
+	Note     string `json:"note,omitempty"`
 	Enabled  bool   `json:"enabled"`
 	Proxy    string `json:"proxy"`
 	Locale   string `json:"locale"`
@@ -359,6 +375,7 @@ type Account struct {
 type AccountStatus struct {
 	ID          string                   `json:"id"`
 	Label       string                   `json:"label"`
+	Note        string                   `json:"note,omitempty"`
 	State       AccountState             `json:"state"`
 	Enabled     bool                     `json:"enabled"`
 	Proxy       string                   `json:"proxy"`
@@ -389,6 +406,10 @@ type AccountStatus struct {
 	// HiddenDiscovered 表示账户目录同步时探测过官网隐藏模型，HiddenModels 是目录中的官网隐藏模型数
 	HiddenDiscovered bool `json:"-"`
 	HiddenModels     int  `json:"-"`
+	// VerificationRequired 表示账户因上游要求验证而受限，可在官网验证页完成验证后恢复
+	VerificationRequired bool `json:"verification_required,omitempty"`
+	// DeviceBoundSession 表示账户会话带 __Secure-1PSIDRTS 且缺少本地续签材料，约 2 小时内失效
+	DeviceBoundSession bool `json:"device_bound_session,omitempty"`
 }
 
 // AccountTransition 是账户正在进行的后台操作
@@ -440,7 +461,7 @@ type AccountSelection struct {
 	Channel            Channel
 	PreferredChannel   Channel
 	InlineMediaKeys    []InlineMediaKey
-	// IgnoreQuotaCooldown 为 true 时套餐限额、每日限额与权限拒绝冷却中的账户照常参与选号，每日限额一分钟内拒绝过不大于 RequestSize 的请求的账户除外，余量多的账户优先
+	// IgnoreQuotaCooldown 为 true 时套餐限额、每日限额与权限拒绝冷却中的账户照常参与选号，拒绝记录有效期内拒绝过不大于 RequestSize 的请求的账户除外，余量多的账户优先
 	IgnoreQuotaCooldown bool
 	// RequestSize 是请求输入正文的字节数，0 表示未知
 	RequestSize int64
@@ -861,6 +882,9 @@ func (c AccountConfig) Validate() error {
 	}
 	if c.AuthUser < 0 || c.AuthUser > 9 {
 		return fmt.Errorf("账户 auth_user 无效: %d", c.AuthUser)
+	}
+	if utf8.RuneCountInString(strings.TrimSpace(c.Note)) > MaxAccountNoteLength {
+		return fmt.Errorf("账户备注不能超过 %d 个字符", MaxAccountNoteLength)
 	}
 	if err := appconfig.ValidateProxy(c.Proxy); err != nil {
 		return fmt.Errorf("账户 proxy 无效: %w", err)
@@ -1891,6 +1915,34 @@ func (p *AccountPool) applyEnabledLocked(account *Account) {
 	p.notifyLocked()
 }
 
+// SetNote 写回账户备注并立即生效，不等待账户上的在途请求
+func (p *AccountPool) SetNote(accountID string, note string) (*Account, error) {
+	accountID = strings.TrimSpace(accountID)
+	note = strings.TrimSpace(note)
+	p.mu.Lock()
+	account := p.byID[accountID]
+	p.mu.Unlock()
+	if account == nil {
+		return nil, fmt.Errorf("%w: %s", ErrAccountNotFound, accountID)
+	}
+	account.storageMu.Lock()
+	defer account.storageMu.Unlock()
+	p.mu.Lock()
+	value := account.Config
+	p.mu.Unlock()
+	value.Note = note
+	if err := value.Validate(); err != nil {
+		return nil, err
+	}
+	if err := writeAccountConfig(account.ConfigPath, value); err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	account.Config.Note = note
+	return account, nil
+}
+
 // SetEnabled 写回账户启用状态并立即生效，不等待账户上的在途请求
 func (p *AccountPool) SetEnabled(accountID string, enabled bool) (*Account, error) {
 	accountID = strings.TrimSpace(accountID)
@@ -1948,6 +2000,29 @@ func (p *AccountPool) setProgressLocked(current *accountProgress, next accountPr
 	p.notifyLocked()
 }
 
+// ReloadStorageState 重新读取账户的认证状态
+func (p *AccountPool) ReloadStorageState(accountID string) (StorageState, error) {
+	account, err := p.Account(accountID)
+	if err != nil {
+		return StorageState{}, err
+	}
+	return p.reloadStorageState(account)
+}
+
+// reloadStorageState 在账户存储锁内从磁盘读取认证状态并同步到池内缓存
+func (p *AccountPool) reloadStorageState(account *Account) (StorageState, error) {
+	account.storageMu.Lock()
+	defer account.storageMu.Unlock()
+	state, err := LoadStorageState(account.StoragePath)
+	if err != nil {
+		return StorageState{}, err
+	}
+	p.mu.Lock()
+	account.StorageState = state
+	p.mu.Unlock()
+	return state, nil
+}
+
 // ReloadStorageState 在租约内重新读取认证状态
 func (l *AccountLease) ReloadStorageState() (StorageState, error) {
 	l.operation.Lock()
@@ -1955,16 +2030,7 @@ func (l *AccountLease) ReloadStorageState() (StorageState, error) {
 	if l.released {
 		return StorageState{}, fmt.Errorf("账户租约已释放")
 	}
-	l.account.storageMu.Lock()
-	defer l.account.storageMu.Unlock()
-	state, err := LoadStorageState(l.account.StoragePath)
-	if err != nil {
-		return StorageState{}, err
-	}
-	l.pool.mu.Lock()
-	l.account.StorageState = state
-	l.pool.mu.Unlock()
-	return state, nil
+	return l.pool.reloadStorageState(l.account)
 }
 
 // ReplaceCookies 以固定指纹浏览器当前 Cookie 替换账户最新持久状态，只有轮换 Cookie 变化且磁盘状态在 rotatingCookieWriteInterval 内写过时不写盘
@@ -2056,28 +2122,42 @@ func (l *AccountLease) ReplaceResource(previousResourceID string, resourceID str
 }
 
 // MergeSetCookieHeaders 将响应 Cookie 合并到账户最新持久状态
-func (l *AccountLease) MergeSetCookieHeaders(headers []string, requestURL string, now time.Time) error {
-	l.operation.Lock()
-	defer l.operation.Unlock()
-	if l.released {
-		return fmt.Errorf("账户租约已释放")
+func (p *AccountPool) MergeSetCookieHeaders(accountID string, headers []string, requestURL string, now time.Time) error {
+	account, err := p.Account(accountID)
+	if err != nil {
+		return err
 	}
-	l.account.storageMu.Lock()
-	defer l.account.storageMu.Unlock()
-	state, err := LoadStorageState(l.account.StoragePath)
+	return p.mergeSetCookieHeaders(account, headers, requestURL, now)
+}
+
+// mergeSetCookieHeaders 在账户存储锁内合并响应 Cookie、写回磁盘并同步到池内缓存
+func (p *AccountPool) mergeSetCookieHeaders(account *Account, headers []string, requestURL string, now time.Time) error {
+	account.storageMu.Lock()
+	defer account.storageMu.Unlock()
+	state, err := LoadStorageState(account.StoragePath)
 	if err != nil {
 		return err
 	}
 	if err := state.MergeSetCookieHeaders(headers, requestURL, now); err != nil {
 		return err
 	}
-	if err := WriteStorageState(l.account.StoragePath, state); err != nil {
+	if err := WriteStorageState(account.StoragePath, state); err != nil {
 		return err
 	}
-	l.pool.mu.Lock()
-	l.account.StorageState = state
-	l.pool.mu.Unlock()
+	p.mu.Lock()
+	account.StorageState = state
+	p.mu.Unlock()
 	return nil
+}
+
+// MergeSetCookieHeaders 将响应 Cookie 合并到账户最新持久状态
+func (l *AccountLease) MergeSetCookieHeaders(headers []string, requestURL string, now time.Time) error {
+	l.operation.Lock()
+	defer l.operation.Unlock()
+	if l.released {
+		return fmt.Errorf("账户租约已释放")
+	}
+	return l.pool.mergeSetCookieHeaders(l.account, headers, requestURL, now)
 }
 
 // Release 释放账户文件和进程内租约
@@ -2129,7 +2209,7 @@ func (p *AccountPool) HasInlineMediaHit(accountIDs []string, keys []InlineMediaK
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, accountID := range accountIDs {
-		if account := p.byID[accountID]; account != nil && p.inlineMediaHitsLocked(account, keys, now) > 0 {
+		if account := p.byID[accountID]; account != nil && account.Config.Enabled && account.State == AccountReady && p.inlineMediaHitsLocked(account, keys, now) > 0 {
 			return true
 		}
 	}
@@ -2523,7 +2603,7 @@ func (p *AccountPool) MarkCooldownIfGeneration(
 	return err
 }
 
-// MarkQuotaCooldownIfGeneration 保存当前目录版本下检查时间为 checkedAt 的额度冷却，递增冷却按同范围上一次冷却计算，同范围已有更晚恢复的冷却时保留它，套餐限额或每日限额冷却期间的其他额度失败只冷却回退选号，换成恢复更晚的同类冷却时回退选号的冷却保留；返回该冷却的恢复时刻与冷却是否因此改变，结果早于已记录的检查时间时恢复时刻为零值
+// MarkQuotaCooldownIfGeneration 保存当前目录版本下检查时间为 checkedAt 的额度冷却，递增冷却按同范围上一次冷却计算，同范围已有恢复更晚的冷却或恢复时刻相差不到一分钟的套餐限额冷却时保留它，套餐限额或每日限额冷却期间的其他额度失败只冷却回退选号，换成恢复更晚的同类冷却时回退选号的冷却保留；返回该冷却的恢复时刻与冷却是否因此改变，结果早于已记录的检查时间时恢复时刻为零值
 func (p *AccountPool) MarkQuotaCooldownIfGeneration(
 	accountID string,
 	modelAccessScope string,
@@ -2568,14 +2648,11 @@ func (p *AccountPool) MarkQuotaCooldownIfGeneration(
 		case cooldown.Escalate:
 			next = planLimitCooldown(base, baseExists, now, cooldown.Reason)
 		}
-		if baseExists && base.Active(now) && !next.Until.After(base.Until) {
+		if baseExists && base.Active(now) && (!next.Until.After(base.Until) || samePlanWindow(base, next)) {
 			next = base
 		}
-		if strings.HasPrefix(cooldown.Reason, DailyLimitKind) && cooldown.RequestSize > 0 {
-			next.RejectedSize, next.RejectedUntil = cooldown.RequestSize, now.Add(rejectedSizeWindow)
-			if exists && now.Before(previous.RejectedUntil) {
-				next.RejectedSize = min(next.RejectedSize, previous.RejectedSize)
-			}
+		if RequestQuotaCooldown(cooldown.Reason) {
+			next = next.withRejection(previous, cooldown.RequestSize, now)
 		}
 		until = next.Until
 		if layered && next.Until.Before(previous.Until) {
@@ -2826,6 +2903,11 @@ func verificationRestriction(reason string) bool {
 	return reason == verificationDenial
 }
 
+// VerificationRequired 判断账户是否因上游要求验证而受限
+func (p *AccountPool) VerificationRequired(accountID string) bool {
+	return p.verificationRestricted(accountID)
+}
+
 // verificationRestricted 判断账户因上游要求验证而服务受限
 func (p *AccountPool) verificationRestricted(accountID string) bool {
 	p.mu.Lock()
@@ -2850,12 +2932,13 @@ func (p *AccountPool) clearRestriction(accountID string) error {
 	return err
 }
 
-// ClearAccountState 清除账户的服务受限、全部冷却与需要重新登录的标记并删除 runtime-state.json 中的受限与冷却记录，启用的账户回到就绪
+// ClearAccountState 清除账户的服务受限、全局冷却与需要重新登录的标记并删除 runtime-state.json 中的受限与全局冷却记录，各模型的冷却保留，启用的账户回到就绪
 func (p *AccountPool) ClearAccountState(accountID string) error {
 	_, err := p.updateRuntime(accountID, func(_ *Account, runtimeState *accountRuntimeState) (bool, func(*Account), error) {
-		changed := runtimeState.Restricted != "" || len(runtimeState.Cooldowns) > 0
+		_, cooling := runtimeState.Cooldowns[globalCooldownKey]
+		changed := runtimeState.Restricted != "" || cooling
 		runtimeState.Restricted = ""
-		clear(runtimeState.Cooldowns)
+		delete(runtimeState.Cooldowns, globalCooldownKey)
 		return changed, func(account *Account) {
 			if account.Config.Enabled {
 				account.State, account.stateMessage = AccountReady, ""
@@ -2947,6 +3030,7 @@ func (p *AccountPool) Status() []AccountStatus {
 		status := AccountStatus{
 			ID:          account.ID,
 			Label:       account.Config.Label,
+			Note:        account.Config.Note,
 			State:       state,
 			Enabled:     account.Config.Enabled,
 			Proxy:       account.Config.Proxy,
@@ -2959,16 +3043,18 @@ func (p *AccountPool) Status() []AccountStatus {
 			Message:     message,
 			Directory:   account.Directory,
 
-			Transition:       progress.operation,
-			TransitionStep:   progress.step,
-			TransitionIndex:  progress.index,
-			TransitionTotal:  progress.total,
-			TransitionSince:  progress.since,
-			CatalogError:     catalogError,
-			ActiveRequests:   account.active,
-			CatalogSyncedAt:  account.catalogSyncedAt,
-			HiddenDiscovered: account.hiddenDiscovered,
-			HiddenModels:     len(account.hiddenModels),
+			Transition:           progress.operation,
+			TransitionStep:       progress.step,
+			TransitionIndex:      progress.index,
+			TransitionTotal:      progress.total,
+			TransitionSince:      progress.since,
+			CatalogError:         catalogError,
+			ActiveRequests:       account.active,
+			CatalogSyncedAt:      account.catalogSyncedAt,
+			HiddenDiscovered:     account.hiddenDiscovered,
+			HiddenModels:         len(account.hiddenModels),
+			VerificationRequired: state == AccountRestricted && verificationRestriction(account.runtime.Restricted),
+			DeviceBoundSession:   account.StorageState.DeviceBoundSession(),
 		}
 		if !account.LastUsed.IsZero() {
 			status.LastUsed = timePointer(account.LastUsed)
@@ -3363,7 +3449,7 @@ func (p *AccountPool) inlineMediaHitsLocked(account *Account, keys []InlineMedia
 		if binding.Kind != "inline-media" {
 			continue
 		}
-		if now.Sub(binding.UsedAt) >= inlineMediaIdle {
+		if !binding.expiresAt().After(now) {
 			continue
 		}
 		cached[InlineMediaKey{
@@ -4246,7 +4332,7 @@ func accountCatalogFingerprint(tier BenefitTier, models []Model) (string, error)
 	return fmt.Sprintf("%x", sha256.Sum256(data)), nil
 }
 
-// quotaHeadroomLocked 返回候选在回退选号中的额度余量：每日限额冷却中为一分钟内上游拒绝过的最小请求字节数，没有拒绝记录时为最大值
+// quotaHeadroomLocked 返回候选在回退选号中的额度余量：套餐限额或每日限额冷却中为有效的拒绝记录记下的最小请求字节数，没有时为最大值
 func (p *AccountPool) quotaHeadroomLocked(candidate channelCandidate, selection AccountSelection, now time.Time) int64 {
 	account := p.accounts[candidate.index]
 	cooldown, exists := account.runtime.Cooldowns[ChannelCooldownScope(candidate.channel, selectionAccessScope(selection))]
@@ -4256,7 +4342,7 @@ func (p *AccountPool) quotaHeadroomLocked(candidate channelCandidate, selection 
 	return cooldown.RejectedSize
 }
 
-// selectionCooldown 返回账户在作用域上对选择生效的冷却，IgnoreQuotaCooldown 的选择不受套餐限额、每日限额与权限拒绝冷却限制，只受其中记录的非权限拒绝回退冷却与每日限额一分钟内拒绝过不大于 RequestSize 的请求的拒绝记录限制，生效到两者中较晚结束的一个
+// selectionCooldown 返回账户在作用域上对选择生效的冷却，IgnoreQuotaCooldown 的选择不受套餐限额、每日限额与权限拒绝冷却限制，只受其中记录的非权限拒绝回退冷却与拒绝过不大于 RequestSize 的请求的有效拒绝记录限制，拒绝记录生效到它失效与冷却恢复中较早的一个，两种限制都有时生效到较晚结束的一个
 func selectionCooldown(account *Account, scope string, selection AccountSelection, now time.Time) (CooldownState, bool) {
 	var selected CooldownState
 	for _, key := range []string{globalCooldownKey, scope} {
@@ -4271,7 +4357,9 @@ func selectionCooldown(account *Account, scope string, selection AccountSelectio
 			blocking := CooldownState{}
 			if cooldown.rejects(selection.RequestSize, now) {
 				blocking = cooldown
-				blocking.Until = cooldown.RejectedUntil
+				if cooldown.RejectedUntil.Before(cooldown.Until) {
+					blocking.Until = cooldown.RejectedUntil
+				}
 			}
 			if fallback := cooldown.Fallback; fallback != nil && fallback.Active(now) && !strings.HasPrefix(fallback.Reason, AccountRejectionKind) && fallback.Until.After(blocking.Until) {
 				blocking = *fallback

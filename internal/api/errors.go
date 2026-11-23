@@ -27,9 +27,36 @@ type errorCodeProvider interface {
 	ErrorCode() string
 }
 
+// readRequestBody 读取请求正文，已知 ContentLength 时先在 maxPrealloc 内预分配，读满后再按实际长度一次性扩容，避免大请求体倍增拷贝
+func readRequestBody(r *http.Request, maxPrealloc int64) ([]byte, error) {
+	if r.ContentLength <= 0 || maxPrealloc <= 0 {
+		return io.ReadAll(r.Body)
+	}
+	buf := make([]byte, 0, min(r.ContentLength, maxPrealloc)+1)
+	for {
+		if len(buf) == cap(buf) {
+			if target := r.ContentLength + 1; int64(cap(buf)) < target && r.ContentLength <= maxPublicBodyBytes {
+				grown := make([]byte, len(buf), target)
+				copy(grown, buf)
+				buf = grown
+			} else {
+				buf = append(buf, 0)[:len(buf)]
+			}
+		}
+		n, err := r.Body.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+		if errors.Is(err, io.EOF) {
+			return buf, nil
+		}
+		if err != nil {
+			return buf, err
+		}
+	}
+}
+
 // decodeJSON 把请求正文解码为一个 JSON 值；读取或解码失败时以同一正文与读取错误逐段解码，返回其错误
 func decodeJSON(r *http.Request, target any) error {
-	body, readErr := io.ReadAll(r.Body)
+	body, readErr := readRequestBody(r, 1<<20)
 	if readErr == nil && json.Unmarshal(body, target) == nil {
 		return nil
 	}
@@ -218,6 +245,18 @@ func writeRouteNotFound(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// writeRequestBodyError 以请求所属协议的错误体返回请求体无法读取的错误
+func writeRequestBodyError(w http.ResponseWriter, r *http.Request, status int, message string) {
+	switch requestProtocol(r) {
+	case "gemini":
+		writeGeminiError(w, status, "INVALID_ARGUMENT", message)
+	case "anthropic":
+		writeAnthropicError(w, status, "invalid_request_error", message)
+	default:
+		writeOpenAIError(w, status, "invalid_request", message)
+	}
+}
+
 // geminiInvalidKeyMessage 是 Gemini API 对无效 API key 的错误信息
 const geminiInvalidKeyMessage = "API key not valid. Please pass a valid API key."
 
@@ -394,7 +433,7 @@ type openAIErrorBody struct {
 }
 
 func openAIErrorType(status int, code string) string {
-	if status == http.StatusBadRequest || status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound {
+	if status == http.StatusBadRequest || status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound || status == http.StatusUnsupportedMediaType {
 		return "invalid_request_error"
 	}
 	if code == "rate_limit_exceeded" {

@@ -29,7 +29,7 @@ func TestAdminConfig(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pool := aistudio.NewAccountPool(nil, 1)
-	admin := &runtimeAdmin{configPath: path, requests: newRequestRegistry(ctx), pool: pool, service: &trackedService{pool: pool}}
+	admin := &runtimeAdmin{configPath: path, requests: newRequestRegistry(), pool: pool, service: &trackedService{pool: pool}}
 	value, err := admin.RuntimeConfig(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -90,7 +90,9 @@ func TestAdminConfigIgnoreThoughtSignatureImmediate(t *testing.T) {
 	pooled := aistudio.NewPooledService(pool, client)
 	pooled.SetIgnoreThoughtSignature(cfg.IgnoreThoughtSignature)
 	service := &trackedService{pool: pool, service: pooled}
-	admin := &runtimeAdmin{configPath: path, requests: newRequestRegistry(ctx), pool: pool, service: service}
+	requests := newRequestRegistry()
+	defer requests.close()
+	admin := &runtimeAdmin{configPath: path, requests: requests, pool: pool, service: service}
 	manager := &runtimeManager{activeManagement: cfg}
 
 	value, err := admin.RuntimeConfig(ctx)
@@ -186,7 +188,8 @@ func TestRestoreAccountInvalidatesDriveCache(t *testing.T) {
 	}
 	client := aistudio.NewClient(aistudio.ClientOptions{Transport: transport})
 	pooled := aistudio.NewPooledService(pool, client)
-	requests := newRequestRegistry(ctx)
+	requests := newRequestRegistry()
+	defer requests.close()
 	service := newTrackedService(ctx, pooled, pool, requests, nil, time.Minute)
 	admin := newRuntimeAdmin(ctx, pool, store, service, requests, nil, nil, config.Default())
 
