@@ -14,20 +14,32 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
 )
 
+// RequestOptions 保存单次请求与目录同步可热替换的行为选项
+type RequestOptions struct {
+	BuildNativeNonstream   bool
+	YouTubeLinks           bool
+	DiscoverHiddenModels   bool
+	StripThoughtSignatures bool
+	ContinuationRewrite    bool
+	ContinuationPrompt     string
+}
+
 // PooledService 在账户租约内调用协议客户端
 type PooledService struct {
 	pool   *AccountPool
 	client *Client
+	// options 为运行时热替换的原子请求行为快照；为空时回退读取下方兼容字段
+	options atomic.Pointer[RequestOptions]
 	// BuildNativeNonstream 让非流式请求优先使用具备资格的 Build 通道
 	BuildNativeNonstream bool
 	// IgnoreThoughtSignature 忽略历史消息中的思考签名以避免 400 校验错误
 	IgnoreThoughtSignature bool
-	ignoreThoughtSigMu     sync.RWMutex
 	// YouTubeLinks 把 user 文本中的 YouTube 链接作为视频外部媒体发送
 	YouTubeLinks bool
 	// DiscoverHiddenModels 让同步账户目录时探测官网前端已配置、ListModels 尚未列出的模型
@@ -48,6 +60,65 @@ type PooledService struct {
 	prewarmingMu sync.Mutex
 	// prewarming 记录正在后台上传预热的附件键
 	prewarming map[string]struct{}
+}
+
+// SetRequestOptions 原子替换后续请求与目录同步使用的行为选项，不中断进行中的请求
+func (s *PooledService) SetRequestOptions(opts RequestOptions) {
+	copyOpts := opts
+	s.options.Store(&copyOpts)
+}
+
+// requestOptions 返回当前生效的行为选项快照
+func (s *PooledService) requestOptions() RequestOptions {
+	if opts := s.options.Load(); opts != nil {
+		return *opts
+	}
+	return RequestOptions{
+		BuildNativeNonstream:   s.BuildNativeNonstream,
+		YouTubeLinks:           s.YouTubeLinks,
+		DiscoverHiddenModels:   s.DiscoverHiddenModels,
+		StripThoughtSignatures: s.StripThoughtSignatures || s.IgnoreThoughtSignature,
+		ContinuationRewrite:    s.ContinuationRewrite,
+		ContinuationPrompt:     s.ContinuationPrompt,
+	}
+}
+
+// ClearHiddenModels 从内存目录与磁盘目录缓存中移除全部官网隐藏模型，返回发生变化的账户数
+func (s *PooledService) ClearHiddenModels() int {
+	changed := s.pool.ClearHiddenModels()
+	for _, accountID := range changed {
+		s.client.ClearHiddenModels(accountID)
+		if source := s.client.modelCatalogSource(accountID); len(source) > 0 {
+			if err := s.pool.SaveCatalogCache(accountID, source); err != nil {
+				slog.Warn("账户模型目录缓存保存失败", "account", accountID, "error", err)
+			}
+		}
+	}
+	return len(changed)
+}
+
+// RefreshBuildCatalog 为单个账户拉取并保存 Build 通道模型目录
+func (s *PooledService) RefreshBuildCatalog(ctx context.Context, accountID string) (bool, error) {
+	lease, owned, err := resolveAccountLease(ctx, s.pool, AccountSelection{AccountID: accountID})
+	if err != nil {
+		return false, err
+	}
+	if owned {
+		defer func() { _ = lease.Release() }()
+	}
+	models, err := s.client.BuildModelsForAccount(ContextWithAccountLease(ctx, lease), accountID)
+	if err != nil {
+		return false, err
+	}
+	if err := s.pool.SetBuildCatalog(accountID, models); err != nil {
+		return false, err
+	}
+	if source := s.client.modelCatalogSource(accountID); len(source) > 0 {
+		if err := s.pool.SaveCatalogCache(accountID, source); err != nil {
+			slog.Warn("账户模型目录缓存保存失败", "account", accountID, "error", err)
+		}
+	}
+	return len(models) > 0, nil
 }
 
 // PoolRequestContextProvider 从租约账户读取协议上下文
@@ -78,8 +149,13 @@ type WorkerProtectedTransportOptions struct {
 type WorkerProtectedTransport struct {
 	transport    *MakerSuiteHTTPTransport
 	workers      ProtectedPreparerProvider
-	setupTimeout time.Duration
+	setupTimeout atomic.Int64
 	runs         *pageRuns
+}
+
+// SetSetupTimeout 更新后续实时会话建连使用的初始化超时
+func (t *WorkerProtectedTransport) SetSetupTimeout(timeout time.Duration) {
+	t.setupTimeout.Store(int64(timeout))
 }
 
 var _ Service = (*PooledService)(nil)
@@ -109,9 +185,11 @@ func NewPoolRequestContextProvider(pool *AccountPool) *PoolRequestContextProvide
 
 // NewWorkerProtectedTransport 创建基于 lazy WAA preparer 的受保护传输
 func NewWorkerProtectedTransport(options WorkerProtectedTransportOptions) *WorkerProtectedTransport {
-	return &WorkerProtectedTransport{
-		transport: options.Transport, workers: options.Workers, setupTimeout: options.SetupTimeout, runs: newPageRuns(),
+	transport := &WorkerProtectedTransport{
+		transport: options.Transport, workers: options.Workers, runs: newPageRuns(),
 	}
+	transport.setupTimeout.Store(int64(options.SetupTimeout))
+	return transport
 }
 
 // DoProtected 写入 fresh proof 后经账户的 WAA 运行时发送 GenerateContent、Build 代理或写代码助手请求，binding 与写入页面输入框的提示词取自关联函数结果后的 contents，页面提示词为最后一个轮次的文本；账户页面再次运行同一对话的 GenerateContent 按官网 Rerun 不写入提示词
@@ -761,22 +839,13 @@ func (l *AccountLease) Model(modelID string) (Model, bool) {
 	return Model{}, false
 }
 
-// InteractionRoute 返回模型在租约账户与当前通道上是否走 CreateInteractionStream 或 CreateInteraction 后台任务
-func (l *AccountLease) InteractionRoute(modelID string) (stream bool, task bool) {
+// InteractionRoute 返回模型在租约账户与当前通道上的 Interaction 选路
+func (l *AccountLease) InteractionRoute(modelID string) InteractionRouting {
 	model, ok := l.Model(modelID)
 	if !ok {
-		return false, false
+		return ResolveInteractionRouting(0, false)
 	}
-	return interactionRoute(model, GenerationDefaults{}, l.Channel())
-}
-
-// interactionRoute 返回模型在指定通道上是否走 CreateInteractionStream 或 CreateInteraction 后台任务
-func interactionRoute(model Model, defaults GenerationDefaults, channel Channel) (stream bool, task bool) {
-	if channel == ChannelBuild {
-		return false, false
-	}
-	return model.Capabilities["interaction_stream"] || defaults.InteractionStream,
-		model.Capabilities["interaction_task"] || defaults.InteractionTask
+	return interactionRouting(model, GenerationDefaults{}, l.Channel())
 }
 
 // DefinitiveAuthenticationFailure 判断上游是否明确要求重新认证
@@ -835,14 +904,15 @@ func (s *PooledService) modelsForLease(ctx context.Context, lease *AccountLease,
 	if err != nil {
 		return nil, s.catalogFailure(leaseCtx, lease, err)
 	}
+	opts := s.requestOptions()
 	var hidden map[string]string
-	if s.DiscoverHiddenModels {
+	if opts.DiscoverHiddenModels {
 		if hidden, err = s.client.DiscoverHiddenModels(leaseCtx, account.ID); err != nil {
 			slog.Warn("探测官网隐藏模型失败", "account", account.ID, "error", err)
 		}
 		models = s.client.accountModels(account.ID)
 	}
-	if err := s.pool.SetHiddenModels(account.ID, hidden, s.DiscoverHiddenModels && err == nil); err != nil {
+	if err := s.pool.SetHiddenModels(account.ID, hidden, opts.DiscoverHiddenModels && err == nil); err != nil {
 		return nil, err
 	}
 	buildEnabled := s.pool.BuildEnabled()
@@ -894,17 +964,23 @@ func (s *PooledService) catalogFailure(ctx context.Context, lease *AccountLease,
 
 // SetIgnoreThoughtSignature 并发安全地更新是否忽略历史思考签名
 func (s *PooledService) SetIgnoreThoughtSignature(enabled bool) {
-	s.ignoreThoughtSigMu.Lock()
-	s.IgnoreThoughtSignature = enabled
-	s.StripThoughtSignatures = enabled
-	s.ignoreThoughtSigMu.Unlock()
+	for {
+		current := s.options.Load()
+		opts := s.requestOptions()
+		if current != nil {
+			opts = *current
+		}
+		opts.StripThoughtSignatures = enabled
+		next := opts
+		if s.options.CompareAndSwap(current, &next) {
+			return
+		}
+	}
 }
 
-func (s *PooledService) shouldIgnoreThoughtSignature() bool {
-	s.ignoreThoughtSigMu.RLock()
-	enabled := s.IgnoreThoughtSignature || s.StripThoughtSignatures
-	s.ignoreThoughtSigMu.RUnlock()
-	return enabled
+// IgnoreThoughtSignatureEnabled 并发安全地返回当前是否忽略历史思考签名
+func (s *PooledService) IgnoreThoughtSignatureEnabled() bool {
+	return s.requestOptions().StripThoughtSignatures
 }
 
 // CountTokens 使用支持目标模型的独占账户按客户端给出的对话计数，只有系统指令时以 user 轮计数后还原为系统指令明细
@@ -913,12 +989,13 @@ func (s *PooledService) CountTokens(ctx context.Context, request TokenCountReque
 	if modelID == "" {
 		return TokenCount{}, fmt.Errorf("%w: CountTokens model 不能为空", ErrInvalidArgument)
 	}
+	opts := s.requestOptions()
 	request.System = clientSystem(request.System)
 	request.Contents = dropUserRejected(request.Contents)
-	if s.YouTubeLinks {
+	if opts.YouTubeLinks {
 		request.Contents = attachYouTubeLinks(request.Contents)
 	}
-	if s.shouldIgnoreThoughtSignature() {
+	if opts.StripThoughtSignatures {
 		request.Contents = sanitizeThoughtSignatures(request.Contents)
 	}
 	systemOnly := len(request.Contents) == 0
@@ -1003,10 +1080,11 @@ func (s *PooledService) ValidateGenerateRequest(request GenerateRequest) error {
 	if modelID == "" {
 		return fmt.Errorf("%w: GenerateContent model 不能为空", ErrInvalidArgument)
 	}
-	if s.shouldIgnoreThoughtSignature() {
+	opts := s.requestOptions()
+	if opts.StripThoughtSignatures {
 		request.Contents = sanitizeThoughtSignatures(request.Contents)
 	}
-	request.System, request.Contents = normalizeTurns(request.System, request.Contents, s.rewritesAssistantTail(modelID), s.ContinuationPrompt)
+	request.System, request.Contents = normalizeTurns(request.System, request.Contents, shouldRewriteAssistantTail(modelID, opts.ContinuationRewrite), opts.ContinuationPrompt)
 	if len(request.Contents) == 0 {
 		return fmt.Errorf("%w: 请求没有系统提示或对话内容", ErrInvalidArgument)
 	}
@@ -1019,12 +1097,17 @@ func (s *PooledService) ValidateGenerateRequest(request GenerateRequest) error {
 
 // generateTurns 返回 Generate 发往上游前改写的系统指令与对话轮
 func (s *PooledService) generateTurns(request GenerateRequest) ([]string, []Content) {
+	return s.generateTurnsWith(request, s.requestOptions())
+}
+
+// generateTurnsWith 按指定选项快照改写系统指令与对话轮
+func (s *PooledService) generateTurnsWith(request GenerateRequest, opts RequestOptions) ([]string, []Content) {
 	modelID := strings.TrimPrefix(strings.TrimSpace(request.Model), "models/")
-	if s.shouldIgnoreThoughtSignature() {
+	if opts.StripThoughtSignatures {
 		request.Contents = sanitizeThoughtSignatures(request.Contents)
 	}
-	system, contents := normalizeTurns(request.System, request.Contents, s.rewritesAssistantTail(modelID), s.ContinuationPrompt)
-	if s.YouTubeLinks {
+	system, contents := normalizeTurns(request.System, request.Contents, shouldRewriteAssistantTail(modelID, opts.ContinuationRewrite), opts.ContinuationPrompt)
+	if opts.YouTubeLinks {
 		contents = attachYouTubeLinks(contents)
 	}
 	return system, contents
@@ -1036,11 +1119,12 @@ func (s *PooledService) Generate(ctx context.Context, request GenerateRequest) (
 	if modelID == "" {
 		return nil, fmt.Errorf("%w: GenerateContent model 不能为空", ErrInvalidArgument)
 	}
-	request.System, request.Contents = s.generateTurns(request)
+	opts := s.requestOptions()
+	request.System, request.Contents = s.generateTurnsWith(request, opts)
 	if len(request.Contents) == 0 {
 		return nil, fmt.Errorf("%w: 请求没有系统提示或对话内容", ErrInvalidArgument)
 	}
-	request.restoreModelTurns = !s.shouldIgnoreThoughtSignature()
+	request.restoreModelTurns = !opts.StripThoughtSignatures
 	resourceID, err := s.pool.ResourceIDForContents(ctx, request.Contents)
 	if err != nil {
 		return nil, err
@@ -1051,7 +1135,7 @@ func (s *PooledService) Generate(ctx context.Context, request GenerateRequest) (
 		AccountID:  strings.TrimSpace(request.AccountID),
 		ResourceID: resourceID,
 	}
-	if RequestNeedsBuild(request) || request.Unary && s.BuildNativeNonstream {
+	if RequestNeedsBuild(request) || request.Unary && opts.BuildNativeNonstream {
 		selection.PreferredChannel = ChannelBuild
 	}
 	pinned := selection.AccountID != "" || selection.ResourceID != ""

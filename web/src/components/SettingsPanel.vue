@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { parseAccountBindings } from '@/accountBindings'
 import { api } from '@/api'
 import { maskKey, splitKeys } from '@/apikey'
+import { useConsole } from '@/console'
 import { desktopPlatform, keepPage, sendDesktop } from '@/desktop'
 import { channelLabelKey, useI18n, type TranslationKey } from '@/i18n'
 import type { IconName } from '@/icons'
@@ -11,9 +12,12 @@ import { maskedProxy } from '@/proxy'
 import type { Account, FirstEventLatency, Model, ServiceConfig, UpstreamChannel } from '@/types'
 import { useQueryParam } from '@/url'
 import { SliderRange, SliderRoot, SliderThumb, SliderTrack } from 'reka-ui'
+import AccountFilterMenu from './AccountFilterMenu.vue'
 import AccountOrderList from './AccountOrderList.vue'
 import ApiKeyInput from './ApiKeyInput.vue'
+import DetailDialog from './DetailDialog.vue'
 import DurationInput from './DurationInput.vue'
+import ModelAccountRows from './ModelAccountRows.vue'
 import PairRows from './PairRows.vue'
 import PathList from './PathList.vue'
 import SettingRow from './SettingRow.vue'
@@ -86,6 +90,8 @@ const sections: {
       'routing_strategy',
       'account_order',
       'max_account_switches',
+      'max_quota_switches',
+      'account_switch_interval',
     ],
   },
   {
@@ -110,6 +116,7 @@ const sections: {
     fields: [
       'model_mapping',
       'model_channels',
+      'model_accounts',
       'ignore_thought_signature',
       'nonstream_keepalive',
       'fake_stream',
@@ -306,6 +313,22 @@ const firstEventTimeoutMode = computed({
   },
 })
 
+// quotaSwitchesMode 是额度用尽换号上限的方式，选自定义时填入 1 次
+const quotaSwitchesMode = computed({
+  get: () => (form.max_quota_switches === 'off' ? 'off' : 'custom'),
+  set: (mode: string) => {
+    form.max_quota_switches = mode === 'custom' ? '1' : 'off'
+  },
+})
+
+// switchIntervalMode 是换号最短间隔的方式，选自定义时填入 5 秒
+const switchIntervalMode = computed({
+  get: () => (form.account_switch_interval === 'off' ? 'off' : 'custom'),
+  set: (mode: string) => {
+    form.account_switch_interval = mode === 'custom' ? '5' : 'off'
+  },
+})
+
 // firstEventTimeoutHedgeWarning 在同时自定义首字超时与首字对冲且首字超时不大于对冲秒数时提醒
 const firstEventTimeoutHedgeWarning = computed(() => {
   if (firstEventTimeoutMode.value !== 'custom' || hedgeMode.value !== 'custom') return false
@@ -355,8 +378,6 @@ const ignoreThoughtSignature = computed({
 
 // apiKeyList 是表单中逗号分隔的各个 API key
 const apiKeyList = computed(() => splitKeys(form.proxy_api_key ?? ''))
-// activeKeys 是生效中的各个 API key
-const activeKeys = computed(() => splitKeys(props.config?.active_proxy_api_key ?? ''))
 
 // writeKeyAccounts 按 API key 的顺序写回 api_key_accounts，去掉已不在 key 列表中的绑定
 function writeKeyAccounts(bindings: Map<string, string[]>): void {
@@ -369,6 +390,13 @@ function writeKeyAccounts(bindings: Map<string, string[]>): void {
 // keyBindings 是表单中各 API key 可用的账户 ID
 const keyBindings = computed(() => parseAccountBindings(form.api_key_accounts ?? ''))
 
+// keyAccountsText 是 key 可用的全部账户名称，下拉按钮截断时悬停显示
+function keyAccountsText(key: string): string {
+  return (keyBindings.value.get(key) ?? [])
+    .map((id) => props.accounts.find((account) => account.id === id)?.label ?? id)
+    .join(', ')
+}
+
 // setKeyAccounts 设置 key 可用的账户，空列表表示可用全部账户
 function setKeyAccounts(key: string, ids: string[]): void {
   const bindings = new Map(keyBindings.value)
@@ -377,16 +405,11 @@ function setKeyAccounts(key: string, ids: string[]): void {
   writeKeyAccounts(bindings)
 }
 
-// accountLabel 返回账户 ID 对应的显示名称
-function accountLabel(id: string): string {
-  return props.accounts.find((account) => account.id === id)?.label ?? id
-}
-
-// keyAccountsLabel 是 key 账户选择按钮的文字：未选时为全部账户，只选一个时为该账户
-function keyAccountsLabel(key: string): string {
-  const ids = keyBindings.value.get(key) ?? []
-  if (ids.length === 0) return t('settings.keyAccountsAll')
-  return ids.length === 1 ? accountLabel(ids[0]!) : t('settings.keyAccountsSome')
+// focusKeyInput 把本地 API 密钥的输入框滚入视野并聚焦
+function focusKeyInput(): void {
+  const input = document.getElementById('setting-api-key')
+  input?.scrollIntoView({ block: 'center' })
+  input?.focus({ preventScroll: true })
 }
 
 // modelIDs 是模型目录中的全部模型 ID
@@ -418,6 +441,53 @@ watch(apiKeyList, () => {
   if (form.api_key_accounts !== undefined)
     writeKeyAccounts(parseAccountBindings(form.api_key_accounts))
 })
+
+const { status, serviceState } = useConsole()
+// restartPending 表示已保存的 WAA 后端或账户状态目录要在生成服务重启后生效，生成服务停止后清除
+const restartPending = ref(false)
+watch(
+  () => props.config,
+  (config) => (restartPending.value = config?.service_restart_required === true),
+  { immediate: true },
+)
+watch(serviceState, (state) => {
+  if (state === 'stopping' || state === 'stopped') restartPending.value = false
+})
+// restartDialog 表示保存后询问是否立即重启生成服务
+const restartDialog = ref(false)
+const restarting = ref(false)
+// activeRequests 是生成服务进行中的请求数
+const activeRequests = computed(() => status.value?.active_requests ?? 0)
+// restartImpact 是重启生成服务会中断的请求数说明
+const restartImpact = computed(() => {
+  if (activeRequests.value === 0) return t('settings.restartNoRequests')
+  return t(
+    activeRequests.value === 1 ? 'settings.restartInterruptsOne' : 'settings.restartInterrupts',
+  ).replace('{count}', String(activeRequests.value))
+})
+
+// restartService 以已保存的配置重启生成服务，进行中的请求随之中断
+async function restartService(): Promise<void> {
+  restartDialog.value = false
+  restarting.value = true
+  try {
+    status.value = await api.restartService()
+    if (status.value.state === 'RUNNING') emit('notice', t('settings.serviceRestarted'), 'success')
+    else
+      emit(
+        'notice',
+        t('settings.serviceRestartState').replace(
+          '{state}',
+          t(status.value.state === 'LAUNCHING' ? 'state.launching' : 'state.stopped'),
+        ),
+        'error',
+      )
+  } catch (error) {
+    emit('notice', errorText(error), 'error')
+  } finally {
+    restarting.value = false
+  }
+}
 
 // resetForm 用已保存配置覆盖表单
 function resetForm(config: ServiceConfig): void {
@@ -467,6 +537,12 @@ onUnmounted(() => {
 // saveConfig 原子保存全局配置
 async function saveConfig(): Promise<void> {
   saving.value = true
+  const restartFields =
+    changedFields.value.has('waa_backend') || changedFields.value.has('auth_states')
+  const sessionFields =
+    changedFields.value.has('admin_auth_enabled') ||
+    changedFields.value.has('admin_username') ||
+    adminPassword.value !== ''
   try {
     const saved = await api.saveConfig({
       ...form,
@@ -476,15 +552,13 @@ async function saveConfig(): Promise<void> {
     })
     emit('saved', saved)
     if (desktopPlatform === 'darwin') sendDesktop(`dock:${saved.hide_dock_icon ? 'hide' : 'show'}`)
-    if (saved.management_restart_required && saved.service_restart_required) {
-      emit('notice', t('settings.savedBoth'), 'success')
-    } else if (saved.management_restart_required) {
-      emit('notice', t('settings.savedManagement'), 'success')
-    } else if (saved.service_restart_required) {
-      emit('notice', t('settings.savedService'), 'success')
-    } else {
-      emit('notice', t('settings.saved'), 'success')
-    }
+    if (sessionFields) window.dispatchEvent(new Event('admin-session-changed'))
+    emit(
+      'notice',
+      t(saved.management_restart_required ? 'settings.savedManagement' : 'settings.saved'),
+      'success',
+    )
+    if (restartFields && saved.service_restart_required) restartDialog.value = true
   } catch (error) {
     emit('notice', errorText(error), 'error')
   } finally {
@@ -546,10 +620,23 @@ async function saveConfig(): Promise<void> {
 
         <div class="min-w-0 flex-1 px-4 pt-4 pb-28 @3xl:pt-8 @3xl:pr-0 @3xl:pl-8">
           <div
-            v-if="config.service_restart_required"
-            class="mb-3 rounded-md border border-blue-500/30 bg-blue-500/10 px-4 py-2.5 text-sm text-blue-200"
+            v-if="restartPending"
+            role="status"
+            class="mb-3 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-md border border-blue-500/30 bg-blue-500/10 px-4 py-2.5 text-sm text-blue-200"
           >
-            {{ t('settings.pendingService') }}
+            <p class="min-w-0 flex-1">
+              {{ t('settings.pendingService') }}
+              <span class="text-blue-300/80">{{ restartImpact }}</span>
+            </p>
+            <button
+              type="button"
+              class="flex shrink-0 items-center gap-1.5 rounded border border-blue-500/40 px-3 py-1 text-xs font-medium text-blue-100 transition hover:bg-blue-500/20 disabled:opacity-50"
+              :disabled="restarting"
+              @click="restartService"
+            >
+              <UiIcon v-if="restarting" name="spinner" :size="13" />
+              {{ t('settings.restartService') }}
+            </button>
           </div>
           <div
             v-if="config.management_restart_required"
@@ -565,7 +652,7 @@ async function saveConfig(): Promise<void> {
               :label="t('settings.autoStart')"
               control-id="setting-auto-start"
               :description="t('settings.autoStartHelp')"
-              effect="management"
+              effect="launch"
               :changed="changedFields.has('auto_start')"
               :env="environmentKey('auto_start')"
             >
@@ -640,7 +727,7 @@ async function saveConfig(): Promise<void> {
               :label="t('settings.apiKey')"
               control-id="setting-api-key"
               :description="t('settings.apiKeyHelp')"
-              effect="management"
+              effect="immediate"
               :changed="changedFields.has('proxy_api_key')"
               :env="environmentKey('proxy_api_key')"
             >
@@ -649,22 +736,9 @@ async function saveConfig(): Promise<void> {
                 v-model:revealed="revealKey"
                 input-id="setting-api-key"
               />
-              <div
-                v-if="apiKeyList.join(',') !== activeKeys.join(',')"
-                class="mt-1.5 flex flex-wrap items-center gap-1 text-xs text-gray-500"
-              >
-                {{ t('settings.activeValue') }}:
-                <span
-                  v-for="key in activeKeys"
-                  :key="key"
-                  class="rounded border border-line px-1.5 py-0.5 font-mono break-all text-gray-400"
-                  >{{ revealKey ? key : maskKey(key) }}</span
-                >
-                <span v-if="activeKeys.length === 0">{{ t('common.empty') }}</span>
-              </div>
             </SettingRow>
             <SettingRow
-              v-if="apiKeyList.length > 0 && accounts.length > 0"
+              v-if="accounts.length > 0"
               :label="t('settings.apiKeyAccounts')"
               group-id="setting-api-key-accounts"
               :description="t('settings.apiKeyAccountsHelp')"
@@ -673,33 +747,42 @@ async function saveConfig(): Promise<void> {
               :env="environmentKey('api_key_accounts')"
             >
               <div
+                v-if="apiKeyList.length > 0"
                 role="group"
                 aria-labelledby="setting-api-key-accounts-label"
-                class="max-h-60 space-y-2 overflow-y-auto pr-1 [scrollbar-width:thin]"
+                class="grid max-h-60 grid-cols-[auto_minmax(0,1fr)] items-center gap-x-3 gap-y-2 overflow-y-auto pr-1 [scrollbar-width:thin]"
               >
-                <div
-                  v-for="key in apiKeyList"
-                  :key="key"
-                  class="flex items-center justify-between gap-3"
-                >
+                <template v-for="key in apiKeyList" :key="key">
                   <span
+                    v-tooltip.overflow="revealKey ? key : maskKey(key)"
                     data-api-key
-                    class="min-w-0 rounded border border-line bg-raised px-2 py-0.5 font-mono text-xs break-all text-gray-200"
+                    class="max-w-40 truncate rounded border border-line bg-raised px-2 py-0.5 font-mono text-xs text-gray-200"
                     >{{ revealKey ? key : maskKey(key) }}</span
                   >
-                  <FilterMenu
-                    field
-                    class="rounded-md border border-line bg-canvas px-2 py-1.5 text-xs text-gray-200"
-                    :label="keyAccountsLabel(key)"
-                    :options="accounts.map((account) => account.id)"
-                    :selected="keyBindings.get(key) ?? []"
-                    :format="accountLabel"
-                    :search-label="t('settings.accountSearch')"
-                    :empty-label="t('settings.accountNone')"
-                    :clear-label="t('settings.keyAccountsClear')"
-                    @change="setKeyAccounts(key, $event)"
-                  />
-                </div>
+                  <div v-tooltip="keyAccountsText(key)" class="min-w-0">
+                    <AccountFilterMenu
+                      field
+                      class="w-full min-w-0 rounded-md border border-line bg-canvas px-2.5 py-1.5 text-xs text-gray-200"
+                      :accounts="accounts"
+                      :selected="keyBindings.get(key) ?? []"
+                      :aria-label="`${maskKey(key)} · ${t('settings.apiKeyAccounts')}`"
+                      @change="setKeyAccounts(key, $event)"
+                    />
+                  </div>
+                </template>
+              </div>
+              <div
+                v-else
+                class="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-md border border-dashed border-line px-3 py-2 text-xs leading-5 text-gray-400"
+              >
+                <span class="min-w-0 flex-1">{{ t('settings.apiKeyAccountsEmpty') }}</span>
+                <button
+                  type="button"
+                  class="shrink-0 font-medium text-blue-400 hover:text-blue-300"
+                  @click="focusKeyInput"
+                >
+                  {{ t('settings.apiKeyAdd') }}
+                </button>
               </div>
             </SettingRow>
             <SettingRow
@@ -850,6 +933,66 @@ async function saveConfig(): Promise<void> {
                 min="0"
               />
             </SettingRow>
+            <SettingRow
+              :label="t('settings.maxQuotaSwitches')"
+              control-id="setting-max-quota-switches"
+              :description="t('settings.maxQuotaSwitchesHelp')"
+              effect="immediate"
+              :changed="changedFields.has('max_quota_switches')"
+              :env="environmentKey('max_quota_switches')"
+            >
+              <UiSelect
+                id="setting-max-quota-switches"
+                v-model="quotaSwitchesMode"
+                :class="inputClass"
+              >
+                <option value="off">{{ t('settings.maxQuotaSwitchesOff') }}</option>
+                <option value="custom">{{ t('settings.firstEventHedgeCustom') }}</option>
+              </UiSelect>
+              <div v-if="quotaSwitchesMode === 'custom'" class="mt-2 flex items-center gap-2">
+                <input
+                  id="setting-max-quota-switches-count"
+                  v-model.trim="form.max_quota_switches"
+                  :class="inputClass"
+                  :aria-label="t('settings.maxQuotaSwitchesCount')"
+                  inputmode="numeric"
+                  autocomplete="off"
+                />
+                <span class="shrink-0 text-sm text-gray-400">{{
+                  t('settings.maxQuotaSwitchesUnit')
+                }}</span>
+              </div>
+            </SettingRow>
+            <SettingRow
+              :label="t('settings.accountSwitchInterval')"
+              control-id="setting-account-switch-interval"
+              :description="t('settings.accountSwitchIntervalHelp')"
+              effect="immediate"
+              :changed="changedFields.has('account_switch_interval')"
+              :env="environmentKey('account_switch_interval')"
+            >
+              <UiSelect
+                id="setting-account-switch-interval"
+                v-model="switchIntervalMode"
+                :class="inputClass"
+              >
+                <option value="off">{{ t('settings.firstEventHedgeOff') }}</option>
+                <option value="custom">{{ t('settings.firstEventHedgeCustom') }}</option>
+              </UiSelect>
+              <div v-if="switchIntervalMode === 'custom'" class="mt-2 flex items-center gap-2">
+                <input
+                  id="setting-account-switch-interval-seconds"
+                  v-model.trim="form.account_switch_interval"
+                  :class="inputClass"
+                  :aria-label="t('settings.firstEventHedgeSeconds')"
+                  inputmode="numeric"
+                  autocomplete="off"
+                />
+                <span class="shrink-0 text-sm text-gray-400">{{
+                  t('settings.firstEventHedgeUnit')
+                }}</span>
+              </div>
+            </SettingRow>
           </template>
 
           <template v-else-if="section === 'runtime'">
@@ -877,7 +1020,7 @@ async function saveConfig(): Promise<void> {
               :label="t('settings.channelRow').replace('{channel}', t(channelLabelKey(channel)))"
               :control-id="`setting-channel-${channel}`"
               :description="t('settings.upstreamChannelsHelp')"
-              effect="service"
+              effect="immediate"
               :changed="
                 changedFields.has('upstream_channels') &&
                 form.upstream_channels.includes(channel) !==
@@ -911,7 +1054,7 @@ async function saveConfig(): Promise<void> {
               :label="t('settings.buildNative')"
               control-id="setting-build-native"
               :description="t('settings.buildNativeHelp')"
-              effect="service"
+              effect="immediate"
               :changed="changedFields.has('build_native_nonstream')"
               :env="environmentKey('build_native_nonstream')"
             >
@@ -921,7 +1064,7 @@ async function saveConfig(): Promise<void> {
               :label="t('settings.initTimeout')"
               control-id="setting-init-timeout"
               :description="t('settings.initTimeoutHelp')"
-              effect="service"
+              effect="immediate"
               :changed="changedFields.has('init_timeout')"
               :env="environmentKey('init_timeout')"
             >
@@ -935,7 +1078,7 @@ async function saveConfig(): Promise<void> {
               :label="t('settings.requestTimeout')"
               control-id="setting-request-timeout"
               :description="t('settings.requestTimeoutHelp')"
-              effect="service"
+              effect="immediate"
               :changed="changedFields.has('request_timeout')"
               :env="environmentKey('request_timeout')"
             >
@@ -949,7 +1092,7 @@ async function saveConfig(): Promise<void> {
               :label="t('settings.firstEventTimeout')"
               control-id="setting-first-event-timeout"
               :description="t('settings.firstEventTimeoutHelp')"
-              effect="service"
+              effect="immediate"
               :changed="changedFields.has('first_event_timeout')"
               :env="environmentKey('first_event_timeout')"
             >
@@ -986,7 +1129,7 @@ async function saveConfig(): Promise<void> {
               :label="t('settings.firstEventHedge')"
               control-id="setting-first-event-hedge"
               :description="hedgeDescription"
-              effect="service"
+              effect="immediate"
               :changed="changedFields.has('first_event_hedge')"
               :env="environmentKey('first_event_hedge')"
             >
@@ -1014,7 +1157,7 @@ async function saveConfig(): Promise<void> {
               :label="t('settings.firstEventHedgeModels')"
               group-id="setting-first-event-hedge-models"
               :description="t('settings.firstEventHedgeModelsHelp')"
-              effect="service"
+              effect="immediate"
               :changed="changedFields.has('first_event_hedge_models')"
               :env="environmentKey('first_event_hedge_models')"
             >
@@ -1076,6 +1219,27 @@ async function saveConfig(): Promise<void> {
               />
             </SettingRow>
             <SettingRow
+              v-if="accounts.length > 0 || form.model_accounts"
+              :label="t('settings.modelAccounts')"
+              group-id="setting-model-accounts"
+              wide
+              :description="t('settings.modelAccountsHelp')"
+              effect="immediate"
+              :changed="changedFields.has('model_accounts')"
+              :env="environmentKey('model_accounts')"
+            >
+              <ModelAccountRows
+                role="group"
+                aria-labelledby="setting-model-accounts-label"
+                :value="form.model_accounts"
+                :models="modelIDs"
+                :accounts="accounts"
+                :model-placeholder="t('settings.selectModel')"
+                :add-label="t('settings.addModelChannel')"
+                @change="form.model_accounts = $event"
+              />
+            </SettingRow>
+            <SettingRow
               :label="t('settings.ignoreThoughtSignature')"
               control-id="setting-ignore-thought-signature"
               :description="t('settings.ignoreThoughtSignatureHelp')"
@@ -1112,7 +1276,7 @@ async function saveConfig(): Promise<void> {
               :label="t('settings.youtubeLinks')"
               control-id="setting-youtube-links"
               :description="t('settings.youtubeLinksHelp')"
-              effect="service"
+              effect="immediate"
               :changed="changedFields.has('youtube_links')"
               :env="environmentKey('youtube_links')"
             >
@@ -1132,7 +1296,7 @@ async function saveConfig(): Promise<void> {
               :label="t('settings.discoverHiddenModels')"
               control-id="setting-discover-hidden-models"
               :description="t('settings.discoverHiddenModelsHelp')"
-              effect="service"
+              effect="immediate"
               :changed="changedFields.has('discover_hidden_models')"
               :env="environmentKey('discover_hidden_models')"
             >
@@ -1152,7 +1316,7 @@ async function saveConfig(): Promise<void> {
               :label="t('settings.continuationRewrite')"
               control-id="setting-continuation-rewrite"
               :description="t('settings.continuationRewriteHelp')"
-              effect="service"
+              effect="immediate"
               :changed="changedFields.has('continuation_rewrite')"
               :env="environmentKey('continuation_rewrite')"
             >
@@ -1162,7 +1326,7 @@ async function saveConfig(): Promise<void> {
               :label="t('settings.continuationPrompt')"
               control-id="setting-continuation-prompt"
               :description="t('settings.continuationPromptHelp')"
-              effect="service"
+              effect="immediate"
               :changed="changedFields.has('continuation_prompt')"
               :env="environmentKey('continuation_prompt')"
             >
@@ -1250,7 +1414,7 @@ async function saveConfig(): Promise<void> {
               :label="t('settings.proxy')"
               control-id="setting-proxy"
               :description="t('settings.proxyHelp')"
-              effect="service"
+              effect="immediate"
               :changed="changedFields.has('proxy')"
               :env="environmentKey('proxy')"
             >
@@ -1268,7 +1432,7 @@ async function saveConfig(): Promise<void> {
               </p>
               <div v-if="config.proxy_pool.length > 1" class="mt-2 text-xs">
                 <p class="text-gray-500">{{ t('settings.proxyPool') }}</p>
-                <ul class="mt-1 space-y-1">
+                <ul class="mt-1 max-h-40 space-y-1 overflow-y-auto pr-1 [scrollbar-width:thin]">
                   <li
                     v-for="entry in config.proxy_pool"
                     :key="entry.proxy"
@@ -1300,7 +1464,7 @@ async function saveConfig(): Promise<void> {
               :label="t('settings.adminAuth')"
               control-id="setting-admin-auth"
               :description="t('settings.adminAuthHelp')"
-              effect="management"
+              effect="immediate"
               :changed="changedFields.has('admin_auth_enabled')"
               :env="environmentKey('admin_auth_enabled')"
             >
@@ -1310,7 +1474,7 @@ async function saveConfig(): Promise<void> {
               <SettingRow
                 :label="t('auth.username')"
                 control-id="setting-admin-username"
-                effect="management"
+                effect="immediate"
                 :changed="changedFields.has('admin_username')"
                 :env="environmentKey('admin_username')"
               >
@@ -1325,7 +1489,7 @@ async function saveConfig(): Promise<void> {
               <SettingRow
                 :label="t('settings.adminPassword')"
                 control-id="setting-admin-password"
-                effect="management"
+                effect="immediate"
                 :changed="adminPassword !== ''"
                 :env="environmentKey('admin_password')"
               >
@@ -1414,5 +1578,36 @@ async function saveConfig(): Promise<void> {
         </div>
       </Transition>
     </form>
+    <DetailDialog
+      :open="restartDialog"
+      :title="t('settings.restartTitle')"
+      narrow
+      @close="restartDialog = false"
+    >
+      <p class="leading-6 text-gray-300">{{ t('settings.pendingService') }}</p>
+      <p
+        class="mt-2 leading-6"
+        :class="activeRequests > 0 ? 'text-amber-300' : 'text-gray-400'"
+        data-restart-impact
+      >
+        {{ restartImpact }}
+      </p>
+      <div class="mt-5 flex items-center justify-end gap-2">
+        <button
+          type="button"
+          class="rounded border border-line bg-raised px-3 py-1.5 text-sm text-gray-300 transition hover:bg-line"
+          @click="restartDialog = false"
+        >
+          {{ t('settings.restartLater') }}
+        </button>
+        <button
+          type="button"
+          class="rounded bg-blue-600 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-blue-500"
+          @click="restartService"
+        >
+          {{ t('settings.restartService') }}
+        </button>
+      </div>
+    </DetailDialog>
   </section>
 </template>

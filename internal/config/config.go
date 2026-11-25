@@ -44,6 +44,8 @@ var configKeys = [...]string{
 	"ROUTING_STRATEGY",
 	"ACCOUNT_ORDER",
 	"MAX_ACCOUNT_SWITCHES",
+	"ACCOUNT_SWITCH_INTERVAL",
+	"MAX_QUOTA_SWITCHES",
 	"UPSTREAM_CHANNELS",
 	"MODEL_MAPPING",
 	"MODEL_CHANNELS",
@@ -104,6 +106,12 @@ const FirstEventTimeoutOff = "off"
 
 // DefaultMaxAccountSwitches 是 MAX_ACCOUNT_SWITCHES 的默认值
 const DefaultMaxAccountSwitches = 3
+
+// AccountSwitchIntervalOff 表示换号前不等待最短间隔
+const AccountSwitchIntervalOff = "off"
+
+// MaxQuotaSwitchesOff 表示额度失败换号次数不限制
+const MaxQuotaSwitchesOff = "off"
 
 // DefaultFirstEventHedgeModels 是 FIRST_EVENT_HEDGE_MODELS 的默认值
 const DefaultFirstEventHedgeModels = "gemini-4-argon"
@@ -168,6 +176,8 @@ type Config struct {
 	RoutingStrategy        string
 	AccountOrder           string
 	MaxAccountSwitches     int
+	AccountSwitchInterval  string
+	MaxQuotaSwitches       string
 	UpstreamChannels       []string
 	ModelMapping           string
 	ModelChannels          string
@@ -221,6 +231,8 @@ func Default() Config {
 		PerAccountConcurrency:  defaultAccountConcurrency,
 		RoutingStrategy:        "round-robin",
 		MaxAccountSwitches:     DefaultMaxAccountSwitches,
+		AccountSwitchInterval:  AccountSwitchIntervalOff,
+		MaxQuotaSwitches:       MaxQuotaSwitchesOff,
 		UpstreamChannels:       []string{"playground"},
 		WAABackend:             WAABackendSpiderMonkey,
 		MediaOutput:            MediaOutputInline,
@@ -271,6 +283,8 @@ var configSetters = map[string]func(*Config, string) error{
 	"WARM_STARTUP_CONCURRENCY": intSetter("WARM_STARTUP_CONCURRENCY", func(c *Config) *int { return &c.WarmStartupConcurrency }),
 	"PER_ACCOUNT_CONCURRENCY":  intSetter("PER_ACCOUNT_CONCURRENCY", func(c *Config) *int { return &c.PerAccountConcurrency }),
 	"MAX_ACCOUNT_SWITCHES":     setMaxAccountSwitches,
+	"ACCOUNT_SWITCH_INTERVAL":  textSetter(func(c *Config) *string { return &c.AccountSwitchInterval }, lowerTrim),
+	"MAX_QUOTA_SWITCHES":       textSetter(func(c *Config) *string { return &c.MaxQuotaSwitches }, lowerTrim),
 	"INIT_TIMEOUT":             durationSetter("INIT_TIMEOUT", func(c *Config) *time.Duration { return &c.InitTimeout }),
 	"REQUEST_TIMEOUT":          durationSetter("REQUEST_TIMEOUT", func(c *Config) *time.Duration { return &c.RequestTimeout }),
 	"ADMIN_USERNAME":           textSetter(func(c *Config) *string { return &c.AdminUsername }, strings.TrimSpace),
@@ -451,6 +465,14 @@ var configChecks = []configCheck{
 			return errMaxAccountSwitches
 		}
 		return nil
+	}},
+	{[]string{"ACCOUNT_SWITCH_INTERVAL"}, func(c Config) error {
+		_, err := ParseAccountSwitchInterval(c.AccountSwitchInterval)
+		return err
+	}},
+	{[]string{"MAX_QUOTA_SWITCHES"}, func(c Config) error {
+		_, _, err := ParseMaxQuotaSwitches(c.MaxQuotaSwitches)
+		return err
 	}},
 	{[]string{"UPSTREAM_CHANNELS"}, func(c Config) error { return validateUpstreamChannels(c.UpstreamChannels) }},
 	{[]string{"MODEL_MAPPING"}, func(c Config) error {
@@ -691,6 +713,8 @@ func (c Config) envValues() map[string]string {
 		"ROUTING_STRATEGY":         c.RoutingStrategy,
 		"ACCOUNT_ORDER":            c.AccountOrder,
 		"MAX_ACCOUNT_SWITCHES":     strconv.Itoa(c.MaxAccountSwitches),
+		"ACCOUNT_SWITCH_INTERVAL":  c.AccountSwitchInterval,
+		"MAX_QUOTA_SWITCHES":       c.MaxQuotaSwitches,
 		"UPSTREAM_CHANNELS":        strings.Join(c.UpstreamChannels, ","),
 		"MODEL_MAPPING":            c.ModelMapping,
 		"MODEL_CHANNELS":           c.ModelChannels,
@@ -799,6 +823,30 @@ func ParseFirstEventTimeout(value string) (time.Duration, error) {
 		return 0, fmt.Errorf("FIRST_EVENT_TIMEOUT 必须是 off 或正整数秒")
 	}
 	return time.Duration(seconds) * time.Second, nil
+}
+
+// ParseAccountSwitchInterval 解析 ACCOUNT_SWITCH_INTERVAL，返回同一请求内换号前的最短等待间隔，off 时为零值
+func ParseAccountSwitchInterval(value string) (time.Duration, error) {
+	if value == AccountSwitchIntervalOff {
+		return 0, nil
+	}
+	seconds, err := strconv.Atoi(value)
+	if err != nil || seconds <= 0 {
+		return 0, fmt.Errorf("ACCOUNT_SWITCH_INTERVAL 必须是 off 或正整数秒")
+	}
+	return time.Duration(seconds) * time.Second, nil
+}
+
+// ParseMaxQuotaSwitches 解析 MAX_QUOTA_SWITCHES，返回额度失败时的换号次数上限与是否启用上限，off 时不限制
+func ParseMaxQuotaSwitches(value string) (int, bool, error) {
+	if value == MaxQuotaSwitchesOff {
+		return 0, false, nil
+	}
+	limit, err := strconv.Atoi(value)
+	if err != nil || limit < 0 {
+		return 0, false, fmt.Errorf("MAX_QUOTA_SWITCHES 必须是 off、0 或正整数")
+	}
+	return limit, true, nil
 }
 
 // ModelList 解析逗号分隔的模型 ID 列表

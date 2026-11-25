@@ -318,7 +318,7 @@ func (p *AccountPool) accountChannelCooldownLocked(account *Account, selection A
 	return earliest, !earliest.Until.IsZero()
 }
 
-// channelCandidatesLocked 按 indices 的账户顺序与通道顺序展开候选，轮询策略改按账户 ID 排序并从上次选中组合之后开始
+// channelCandidatesLocked 按 indices 的账户顺序与通道顺序展开候选，轮询策略按最近使用时间最久优先排列
 func (p *AccountPool) channelCandidatesLocked(indices []int, selection AccountSelection) []channelCandidate {
 	channels := p.selectionChannelsLocked(selection)
 	candidates := make([]channelCandidate, 0, len(indices)*len(channels))
@@ -329,29 +329,21 @@ func (p *AccountPool) channelCandidatesLocked(indices []int, selection AccountSe
 	}
 	rank := func(channel Channel) int { return slices.Index(channels, channel) }
 	if p.routingStrategy == "round-robin" && (len(indices) > 1 || len(channels) > 1) {
+		scope := selectionAccessScope(selection)
+		byPair := p.lastUsed[scope]
 		sort.SliceStable(candidates, func(left, right int) bool {
-			leftID, rightID := p.accounts[candidates[left].index].ID, p.accounts[candidates[right].index].ID
+			leftID := p.accounts[candidates[left].index].ID
+			rightID := p.accounts[candidates[right].index].ID
+			leftUsed := byPair[channelUseKey{accountID: leftID, channel: candidates[left].channel}]
+			rightUsed := byPair[channelUseKey{accountID: rightID, channel: candidates[right].channel}]
+			if diff := compareLastUsed(leftUsed, rightUsed); diff != 0 {
+				return diff < 0
+			}
 			if leftID != rightID {
 				return leftID < rightID
 			}
 			return rank(candidates[left].channel) < rank(candidates[right].channel)
 		})
-		key := selectionAccessScope(selection)
-		lastAccount := p.lastPicked[key]
-		lastChannel := p.lastPickedChannel[key]
-		start := sort.Search(len(candidates), func(position int) bool {
-			account := p.accounts[candidates[position].index].ID
-			if account != lastAccount {
-				return account > lastAccount
-			}
-			return lastChannel != "" && rank(candidates[position].channel) > rank(lastChannel)
-		})
-		if start > 0 {
-			rotated := make([]channelCandidate, 0, len(candidates))
-			rotated = append(rotated, candidates[start:]...)
-			rotated = append(rotated, candidates[:start]...)
-			candidates = rotated
-		}
 	}
 	if len(selection.InlineMediaKeys) > 0 && len(candidates) > 1 {
 		now := time.Now().UTC()
@@ -623,4 +615,20 @@ func (p *AccountPool) AccountChannelAvailable(accountID string, selection Accoun
 	}
 	_, cooling := p.accountChannelCooldownLocked(account, selection, time.Now())
 	return !cooling
+}
+
+// AccountsMissingBuildCatalog 返回启用、可同步且尚未缓存 Build 模型目录的账户 ID
+func (p *AccountPool) AccountsMissingBuildCatalog() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var ids []string
+	for _, account := range p.accounts {
+		if !account.Config.Enabled || len(account.buildModels) > 0 {
+			continue
+		}
+		if account.State == AccountReady || account.State == AccountBusy || account.State == AccountCooldown {
+			ids = append(ids, account.ID)
+		}
+	}
+	return ids
 }

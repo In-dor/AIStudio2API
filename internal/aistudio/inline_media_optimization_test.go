@@ -102,11 +102,13 @@ func TestStickyRoutingForInlineMedia(t *testing.T) {
 		t.Errorf("expected acc-1 third, got %s", pool.accounts[indices[2]].ID)
 	}
 
-	// 2. 验证 channelCandidatesLocked: 无论 lastPicked 处于何种状态，acc3 始终排在候选首位
-	pool.lastPicked["gemini-2.5-flash"] = "acc-3"
+	// 2. 验证 channelCandidatesLocked: 即使 acc-3 刚刚被使用过（LRU 本应排最后），acc3 仍因内联命中数最高排在候选首位
+	pool.lastUsed["gemini-2.5-flash"] = map[channelUseKey]time.Time{
+		{accountID: "acc-3", channel: ChannelPlayground}: time.Now().UTC(),
+	}
 	candidates := pool.channelCandidatesLocked(indices, selection)
 	if len(candidates) != 3 || pool.accounts[candidates[0].index].ID != "acc-3" {
-		t.Fatalf("expected channelCandidatesLocked to have acc-3 first even when lastPicked is acc-3, got %s", pool.accounts[candidates[0].index].ID)
+		t.Fatalf("expected channelCandidatesLocked to have acc-3 first even when acc-3 was just used, got %s", pool.accounts[candidates[0].index].ID)
 	}
 
 	// 3. 端到端验证 pool.AcquireFor: 连续多次真实请求必须 100% 粘在命中数最高的 acc-3 上，不发生轮询漂移
@@ -130,7 +132,7 @@ func TestStickyRoutingForInlineMedia(t *testing.T) {
 		}
 	}
 
-	// 4. 中间穿插其它不带附件的请求改变 lastPicked，验证带附件的请求依然 100% 粘在 acc-3 上
+	// 4. 中间穿插其它不带附件的请求改变 lastUsed，验证带附件的请求依然 100% 粘在 acc-3 上
 	normalSelection := AccountSelection{
 		ModelID: "gemini-2.5-flash",
 		Method:  "generateContent",

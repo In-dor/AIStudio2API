@@ -64,7 +64,7 @@ go run ./cmd/aistudio2api
 | 指定 Chrome 账户 | `aistudio2api setup --profile <PROFILE>` 或重复使用 `--email` | 批量、确定性导入 |
 | 隔离登录 | `aistudio2api setup --login` | 可见 Camoufox 中手动完成 Google 登录，需要图形界面，没有图形界面时报错并指向管理页面的浏览器登录 |
 | 文件导入 | `aistudio2api setup --storage-state <file>` | 导入 Playwright storage state 结构 |
-| Cookie 导入 | `aistudio2api setup --cookie-file <file>`、`--cookie <Cookie 请求头>` 或 `--cdp <调试地址>`，账户邮箱按 Cookie 识别 | 导入浏览器扩展导出的 Cookie JSON、Netscape cookies.txt、一行 Cookie 请求头，或经远程调试地址读取指纹浏览器与 Chromium 中的 Cookie |
+| Cookie 导入 | `aistudio2api setup --cookie-file <file>`、`--cookie <Cookie 请求头>` 或 `--cdp <调试地址>`，账户邮箱按 Cookie 识别 | 导入浏览器扩展导出的 Cookie JSON、Netscape cookies.txt、一行 Cookie 请求头，或经远程调试地址读取支持远程调试的 Chromium 或 Firefox 浏览器中的 Cookie |
 
 `setup` 还接受以下参数：
 
@@ -82,10 +82,10 @@ go run ./cmd/aistudio2api
 
 - 文件导入：`--storage-state`
 - Cookie 导入：`--cookie`、`--cookie-file` 或 `--cdp`，账户邮箱按 Cookie 识别，也可用一个 `--email` 指定；`--authuser N` 选择 Cookie 中第 N 个 Google 会话（官网 `/u/N/`）的账户并验证其邮箱；只保留 google.com 及其子域的 Cookie，缺少 `__Secure-1PSID`、`SAPISID`、`__Secure-1PAPISID` 或 `__Secure-3PAPISID` 时报告缺少的 Cookie
-- `--cdp` 接受 `host:port`、HTTP 调试地址或浏览器级 `ws://` 地址，经 CDP `Storage.getCookies` 读取该浏览器的全部未分区 Cookie
+- `--cdp` 接受 `host:port`、HTTP 调试地址或浏览器级 `ws://` 地址：Chromium 经 CDP `Storage.getCookies` 读取全部未分区 Cookie；Firefox 内核浏览器（`/json/version` 无 CDP 信息、产品名为 Firefox，或 `ws://` 根路径与 `/session`）经 WebDriver BiDi `session.new` 与 `storage.getCookies` 按默认用户上下文和 `https://aistudio.google.com` 的 `storageKey` 分区读取，同键保留先出现的未分区项，排除第三方站点与其余容器的 Cookie
 - 管理页面导入 Cookie 只需粘贴 Cookie 或选择 Cookie 文件：页面在粘贴或输入停顿后自动识别，服务以 Cookie 打开 AI Studio 对话页，从页面全局数据 `oPEP7c` 读取登录账户邮箱，再读取 `ListModels` 确认可用；页面转到登录页时返回 `signed_out`；账户池中已有的账户标为 `imported`，其中需要重新登录的另标 `sign_in_required` 并默认勾选，导入时原地更新该账户，冷却与运行状态保留
 - 管理页面的添加、导入与重新登录在服务端的账户任务中运行（`internal/api/account_tasks.go`）：请求返回 202 与任务后对话框即关闭，任务在请求结束后继续运行，逐个处理账户并把每个账户的状态、当前步骤、错误码与原因推送到管理事件流的 `account_tasks`，账户页据此显示任务行；浏览器登录任务带登录窗口 ID，页内登录窗口隐藏或页面刷新后以同一 ID 重新连接
-- “从指纹浏览器导入”从本机进程命令行找出带 `--remote-debugging-port` 的浏览器（端口为 0 时读取用户数据目录的 `DevToolsActivePort`），逐个读取 Cookie 并识别账户，列出可导入、已导入与未登录的浏览器
+- “从指纹浏览器导入”从本机进程命令行找出带 `--remote-debugging-port` 的浏览器（端口为 0 时读取 Chromium 用户数据目录的 `DevToolsActivePort` 或外部 Firefox profile 目录的 `WebDriverBiDiServer.json`，不给端口值时按 Firefox 默认端口 9222），逐个读取 Cookie 并识别账户，列出可导入、已导入与未登录的浏览器
 - 隔离登录：`--login`
 - 浏览器导入：Chrome 导入参数
 
@@ -448,7 +448,7 @@ Camoufox 运行中与服务的 WebDriver BiDi 连接断开时，服务最多等 
 | `first_event_hedge`、`first_event_hedge_models`、`first_event_timeout` | 下一次启动生成服务时使用的首字超时备用请求与单次首字超时设置 |
 | `strip_thought_signatures` | 下一次启动生成服务时使用的思考签名去除开关 |
 | `routing_strategy`、`account_order` | 保存后立即作用于账户选择的策略与 `fill-first` 顺序 |
-| `max_account_switches` | 保存后立即作用于换号判断的次数上限 |
+| `max_account_switches`、`account_switch_interval`、`max_quota_switches` | 保存后立即作用于换号次数上限、换号间隔与额度用尽换号上限 |
 | `api_key_accounts` | 保存后立即作用于新请求的 API key 账户绑定 |
 | `model_channels`、`model_accounts` | 保存后立即作用于新请求的按模型通道与账户限定 |
 | `media_output`、`media_base_url` | 保存后立即作用于新请求的媒体引用方式与媒体服务地址 |
@@ -457,17 +457,19 @@ Camoufox 运行中与服务的 WebDriver BiDi 连接断开时，服务最多等 
 | `hide_dock_icon` | macOS 桌面版是否隐藏 Dock 图标，保存后立即生效 |
 | `request_body_log` | 保存后立即决定是否保存请求与响应正文 |
 | `log_file`、`log_max_total_mb` | 保存后立即开关日志文件并按新的总量上限轮转 |
-| `admin_auth_enabled`、`admin_username`、`admin_password` | 保存的管理登录配置；省略密码保留现值，密码只接受写入 |
+| `admin_auth_enabled`、`admin_username`、`admin_password` | 管理登录配置，保存后立即生效；省略密码保留现值，密码只接受写入；本机启用或改密时自动为当前请求签发新会话 Cookie 并撤销其余会话，非回环请求禁止关闭登录 |
 | `admin_password_set` | 是否已配置管理密码 |
-| `listen_addr`、`proxy_api_key` | 保存的管理监听配置 |
+| `listen_addr` | 保存的管理监听地址，管理进程重启后生效 |
+| `proxy_api_key` | 本机 API key，保存后立即作用于新请求 |
 | `preview_listen_addr` | 保存的 API 试用页预览来源监听地址，管理进程重启后生效 |
 | `active_preview_listen_addr` | 当前管理进程实际使用的预览来源地址 |
-| `active_listen_addr`、`active_proxy_api_key` | 当前管理进程固定使用的值 |
+| `active_listen_addr` | 当前管理进程实际使用的监听地址 |
 | `reserved_listen_addr` | 被 Windows 保留而改用 `active_listen_addr` 的监听地址，没有改用时为空 |
 | `active_proxy` | 当前生成服务使用的出口，代理池为逗号分隔的全部代理，`proxy` 为空时为系统代理，没有系统代理时为空 |
 | `proxy_pool` | 当前生成服务的代理池：每个代理的地址、是否可用、绑定账户数、最近检测时间与最近错误 |
-| `management_restart_required` | 保存的监听地址、API key 或管理登录配置与当前管理进程不同 |
-| `service_restart_required` | 保存的生成服务配置与当前生成服务实例不同 |
+| `active_requests` | 当前生成服务进行中的请求数 |
+| `management_restart_required` | 保存的 `listen_addr` 或 `preview_listen_addr` 与当前管理进程不同 |
+| `service_restart_required` | 生成服务运行中，且保存的 `waa_backend` 或 `auth_states` 与当前生成服务实例不同 |
 | `environment` | 取自进程环境变量、覆盖 `.env` 的配置键 |
 | `invalid` | 取值无效而按默认值运行的项，每项为 `key`、`value` 与 `reason` |
 
@@ -639,7 +641,7 @@ Worker 容量由热池目标、活动上限和单账户并发共同约束。
 - 先用 Worker 已就绪且没有活动请求的其他账户，没有时用原账户的其余并发槽位
 - 引用已上传文件或指定账户的请求只用原账户的其余并发槽位
 - 都没有时每秒复查；同时进行的备用请求最多 4 个
-- 后台 Responses 与 Interaction、Deep Research 与 Antigravity 等经后台任务生成的 agent（`interaction_task`）与 `-build` 写代码助手请求不发起备用请求
+- 后台 Responses 与 Interaction、Deep Research 与 Antigravity 等 agent（`interaction_agent`）与 `-build` 写代码助手请求不发起备用请求
 
 结果：
 
@@ -647,7 +649,7 @@ Worker 容量由热池目标、活动上限和单账户并发共同约束。
 - 被取消的请求同样计入上游的每日与每分钟请求额度
 - 账本的 `attempts` 以 `hedge` 标记备用请求，以 `superseded` 标记被取代的一方
 
-`FIRST_EVENT_TIMEOUT` 不为 `off` 时，除后台 Responses、后台 Interactions 与经后台任务生成的 agent（`interaction_task`）外，每次生成尝试（含 `-build` 写代码助手）从取得账户起等待首个语义事件达到阈值后，取消该尝试并换号：
+`FIRST_EVENT_TIMEOUT` 不为 `off` 时，除后台 Responses、后台 Interactions 与 agent（`interaction_agent`）外，每次生成尝试（含 `-build` 写代码助手）从取得账户起等待首个语义事件达到阈值后，取消该尝试并换号：
 
 - 计入 `MAX_ACCOUNT_SWITCHES`，不冷却账户、不改账户状态、不重建 Worker；没有可换账户或换号用尽时返回 504 并写明 `FIRST_EVENT_TIMEOUT`
 - 与 `FIRST_EVENT_HEDGE` 同开时原请求与备用请求各自计时，一方到期取消不影响另一方继续等待；`REQUEST_TIMEOUT` 管整个请求，更早到期时直接结束请求不换号
